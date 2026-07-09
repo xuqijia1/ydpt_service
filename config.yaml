@@ -1,0 +1,106 @@
+# ==================== 核心配置（必填/高频修改） ====================
+# 推理后端配置
+inference:
+  backend: "yolov8"        # 可选：yolov8 / ascend / rockchip
+  device_id: "cuda:0"               # yolov8: cuda:0/cpu; ascend: 0/1; rockchip: 0/1/2/3 (NPU核心)
+  yolov8_model_path: "weights/best.pt"
+  ascend_om_model_path: "weights/best.om"
+  rockchip_model_path: "weights/best.rknn"
+  rockchip_target: "rk3576"  # Rockchip 目标芯片型号 (rk3567/rk3588/rk3576等)
+  rockchip_preprocess_mode: "non_quant"  # 预处理模式: non_quant(模型内归一化) / quant(手动归一化)
+  bm_model_path: "weights/best.bmodel"
+
+# 视频源配置
+video:
+  rtsp_url: "test.mp4"       # RTSP流地址/本地视频文件路径
+  write_fps: null            # 录制帧率（null=自动获取视频源帧率，兜底25fps）
+  codec: "mp4v"              # 视频编码器：mp4v/XVID/MJPG（长时间录制建议用XVID）
+
+# 存储路径配置
+storage:
+  # 图片/视频基础路径（跨平台自动适配）
+  image_base_dir: "/home/kickpi/StepImages"    # Linux默认
+  image_sub_dir: "YDPT/{date}/{userid}"
+  video_base_dir: "/home/kickpi/ExamVideos"    # Linux默认
+  video_sub_dir: "YDPT/{date}/{userid}"
+  # 临时存储目录
+  video_save_dir: "./videos"
+  image_save_dir: "./images"
+  # 区域配置文件
+  zones_config_file: "./config/zones_config.json"
+  # 配置页面背景图
+  config_background_image: "./config/config_background.jpg"
+
+# ==================== 功能开关配置 ====================
+feature:
+  enable_streaming: true     # 启用浏览器视频流
+  enable_client_callback: true  # 启用客户端回调
+  enable_recording: false      # 禁用视频录制（板端省资源）
+  debug_mode: false            # 调试模式（打印详细日志）
+
+# ==================== 检测参数配置 ====================
+detection:
+  interval: 0.3              # 检测频率（秒）
+  iou_threshold: 0.45        # NMS去重IOU阈值
+  conf_threshold: 0.5       # 置信度阈值（量化模型建议0.25，非量化可用0.5）
+  config_width: 1920         # 配置页面分辨率
+  config_height: 1080        # 配置页面分辨率
+  # 检测区域（基于配置页面分辨率1920x1080）
+  # 只有区域内的检测框才会被返回，格式：[x1, y1, x2, y2]
+  # 设置为 null 表示全画面有效
+  recog_area: [340, 0, 1700, 1080]
+
+# ==================== 客户端回调配置 ====================
+callback:
+  step_url: "http://127.0.0.1:8070/Data_return"        # 步骤回调地址
+  coordinates_url: "http://127.0.0.1:8070/coordinates_return"  # 坐标回调地址
+
+# ==================== FFmpeg 专属配置（PTS修复核心） ====================
+ffmpeg:
+  disable_auto_pts: true     # 禁用自动PTS生成，手动控制时序
+  log_level: "error"         # 日志级别：error/warning/info/debug
+  flush_timeout: 1.0         # 关闭时冲刷缓存超时时间（秒）
+  valid_frame_min_size: 1024 # 有效帧最小字节数（过滤空帧）
+
+# ==================== 服务部署配置 ====================
+service:
+  port: 8512                # Flask服务监听端口
+  host: "0.0.0.0"           # 监听地址（默认全网可访问）
+  threaded: true            # 启用多线程
+  debug: false              # Flask调试模式（生产环境禁用）
+  use_reloader: false       # 禁用自动重载（Windows避免端口冲突）
+
+# ==================== 系统配置（多服务部署） ====================
+system:
+  # CPU亲和性设置（多服务部署时避免争抢CPU）
+  # 设置为 null 表示不绑定特定核心，由操作系统调度
+  # 示例：[52, 53] 表示绑定到 CPU 核心 52 和 53
+  cpu_cores: null            # 板端单服务部署，不需要绑定CPU核心
+
+# ==================== 步骤验证参数配置 ====================
+step_validation:
+  # 通用参数
+  min_stable_frames: 3           # 默认最小稳定帧数
+  persistence_threshold: 0.5     # 历史帧通过率阈值
+  confidence_threshold: 0.3      # 置信度阈值
+  stability_threshold: 1         # 稳定性过滤阈值（物体需要被跟踪的帧数，1=首次检测即有效）
+
+  # 空间关系参数（像素，会根据分辨率自动缩放）
+  spatial:
+    nearby_threshold: 150        # 步骤5: 手套-脚轮接近距离
+    attached_v_tolerance: 50     # 步骤6: 脚轮-门架垂直容差
+    iou_threshold: 0.2           # 步骤5: IoU接近阈值
+    scale_with_resolution: true  # 是否随分辨率缩放
+
+  # 步骤特定参数
+  steps:
+    step_5:
+      min_caster_count: 4        # 最少脚轮数量
+      nearby_threshold: 150
+    step_6:
+      min_gantry_count: 2        # 最少门架数量
+      min_caster_count: 3        # 最少脚轮数量
+      vertical_tolerance: 50     # 垂直容差
+    step_12:
+      disassembly_frames: 10     # 拆除确认帧数
+      person_required: true      # 是否需要人在现场
