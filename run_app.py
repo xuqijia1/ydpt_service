@@ -1079,8 +1079,8 @@ def trigger_step(step_num, frame, result, user_id):
             print(f"保存步骤图片失败: {e}")
             img_path = None
 
-    # 回调客户端通知步骤完成
-    send_to_client(step_name, result, img_path, user_id)
+    # 异步回调客户端通知步骤完成
+    callback_sender.send_step_result(step_name, result, img_path, user_id)
     print(f"[OK] 步骤 {step_num} ({step_name}) 完成: {'通过' if result else '未完成'}")
 
 def send_to_client(step_name, result, img_path, user_id):
@@ -1132,6 +1132,45 @@ def send_coordinates_to_client(coordinate_data, user_id):
         pass
     except Exception as e:
         print(f"[ICON] 坐标数据回调异常: {str(e)}")
+
+class CallbackSender:
+    """异步回调发送器：专用线程+队列，解耦HTTP I/O与推理消费循环"""
+    def __init__(self, maxsize=100):
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while True:
+            try:
+                task = self._queue.get(timeout=0.5)
+                task_type = task[0]
+                if task_type == 'coord':
+                    _, data, user_id = task
+                    send_coordinates_to_client(data, user_id)
+                elif task_type == 'step':
+                    _, step_name, result, img_path, user_id = task
+                    send_to_client(step_name, result, img_path, user_id)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[CallbackSender] 执行异常: {e}")
+
+    def _enqueue(self, task):
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+        self._queue.put_nowait(task)
+
+    def send_coordinates(self, coordinate_data, user_id):
+        self._enqueue(('coord', coordinate_data, user_id))
+
+    def send_step_result(self, step_name, result, img_path, user_id):
+        self._enqueue(('step', step_name, result, img_path, user_id))
+
+callback_sender = CallbackSender()
 
 def build_csharp_coordinate_data(detections, device_type=1, recog_area=None):
     """构造符合C#客户端要求的坐标数据格式"""
@@ -1298,7 +1337,7 @@ class InferencePipeline:
                 state.latest_detections = detections
                 if state.user_id and Config.ENABLE_CLIENT_CALLBACK:
                     csharp_data = build_csharp_coordinate_data(detections, recog_area=Config.RECOG_AREA)
-                    send_coordinates_to_client(csharp_data, state.user_id)
+                    callback_sender.send_coordinates(csharp_data, state.user_id)
                 check_step_logic_enhanced(detections, vis_frame)
             except:
                 continue
@@ -1449,7 +1488,7 @@ def analyze_and_check(frame):
         # 实时回调坐标数据到客户端
         if state.user_id and Config.ENABLE_CLIENT_CALLBACK:
             csharp_data = build_csharp_coordinate_data(detections, recog_area=Config.RECOG_AREA)
-            send_coordinates_to_client(csharp_data, state.user_id)
+            callback_sender.send_coordinates(csharp_data, state.user_id)
         # 检查作业步骤逻辑
         check_step_logic_enhanced(detections, vis_frame)
     except Exception as e:
