@@ -33,7 +33,6 @@ DEFAULT_CONFIG = {
     "feature": {
         "enable_streaming": True,
         "enable_client_callback": True,
-        "enable_recording": True,
         "debug_mode": False
     },
     "detection": {
@@ -56,6 +55,15 @@ DEFAULT_CONFIG = {
         "log_level": "error",
         "flush_timeout": 1.0,
         "valid_frame_min_size": 1024
+    },
+    "dvpp": {
+        "enabled": False,
+        "device_id": 0,
+        "channel_id": None,
+        "en_type": "H265",
+        "out_format": "NV12",
+        "auto_detect_codec": True,
+        "max_reconnect_attempts": 3,
     },
     "service": {
         "port": 5010,
@@ -132,7 +140,11 @@ def override_with_env(config: Dict):
         "ENABLE_DEBUG": "feature.debug_mode",
         "VIDEO_CODEC": "video.codec",
         "SERVICE_PORT": "service.port",
-        "SERVICE_HOST": "service.host"
+        "SERVICE_HOST": "service.host",
+        "DVPP_ENABLED": "dvpp.enabled",
+        "DVPP_CHANNEL_ID": "dvpp.channel_id",
+        "DVPP_EN_TYPE": "dvpp.en_type",
+        "DVPP_AUTO_DETECT_CODEC": "dvpp.auto_detect_codec",
     }
     for env_name, config_path in env_mapping.items():
         env_value = os.getenv(env_name)

@@ -16,7 +16,10 @@ import multiprocessing as mp
 import setproctitle
 
 # 导入统一推理引擎模块
-from inference_engine import create_inference_engine, draw_detection_boxes, render_chinese_texts, CLASS_COLORS, _PIL_FONT
+from inference_engine import create_inference_engine, draw_detection_boxes, render_chinese_texts, CLASS_COLORS, _PIL_FONT, get_adaptive_recog_area
+
+# 导入视频帧处理模块
+import video_processor
 
 # ===================== CPU 亲和性设置（多服务部署时避免争抢CPU） =====================
 def set_cpu_affinity(cpu_list=None):
@@ -129,6 +132,15 @@ class Config:
     FFMPEG_FLUSH_TIMEOUT = global_config["ffmpeg"]["flush_timeout"]
     FFMPEG_VALID_FRAME_MIN_SIZE = global_config["ffmpeg"]["valid_frame_min_size"]
 
+    # ==================== DVPP 硬解码配置（Ascend 后端） ====================
+    DVPP_DECODE_ENABLED = global_config.get("dvpp", {}).get("enabled", False)
+    DVPP_DEVICE_ID = global_config.get("dvpp", {}).get("device_id", 0)
+    DVPP_CHANNEL_ID = global_config.get("dvpp", {}).get("channel_id", None)
+    DVPP_EN_TYPE = global_config.get("dvpp", {}).get("en_type", "H265")
+    DVPP_OUT_FORMAT = global_config.get("dvpp", {}).get("out_format", "NV12")
+    DVPP_AUTO_DETECT_CODEC = global_config.get("dvpp", {}).get("auto_detect_codec", True)
+    DVPP_MAX_RECONNECT = global_config.get("dvpp", {}).get("max_reconnect_attempts", 3)
+
     # ==================== 服务部署配置（新增！关键修复） ====================
     SERVICE_PORT = global_config["service"]["port"]          # 服务端口
     SERVICE_HOST = global_config["service"]["host"]          # 监听地址
@@ -151,30 +163,6 @@ class Config:
     SPATIAL_ATTACHED_V_TOLERANCE = global_config.get("step_validation", {}).get("spatial", {}).get("attached_v_tolerance", 50)
     SPATIAL_IOU_THRESHOLD = global_config.get("step_validation", {}).get("spatial", {}).get("iou_threshold", 0.2)
     SPATIAL_SCALE_WITH_RESOLUTION = global_config.get("step_validation", {}).get("spatial", {}).get("scale_with_resolution", True)
-
-# ==================== FFmpeg 专用工具函数（PTS/断言修复核心） ====================
-def setup_ffmpeg_env():
-    """配置FFmpeg环境变量，禁用自动PTS、控制日志级别，避免断言崩溃"""
-    if Config.FFMPEG_DISABLE_AUTO_PTS:
-        os.environ["OPENCV_FFMPEG_WRITE_NO_AUTO_PTS"] = "1"
-    os.environ["OPENCV_FFMPEG_LOG_LEVEL"] = Config.FFMPEG_LOG_LEVEL
-    os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
-    # 通过FFmpeg选项抑制HEVC解码器警告(POC/cu_qp_delta等)
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "loglevel;error"
-    print(f"[OK] FFmpeg环境配置完成: 禁用自动PTS={Config.FFMPEG_DISABLE_AUTO_PTS}, 日志级别={Config.FFMPEG_LOG_LEVEL}")
-
-def is_valid_frame(frame):
-    """校验帧有效性，过滤空帧/损坏帧/极小帧，避免触发FFmpeg断言"""
-    if frame is None:
-        return False
-    if frame.ndim != 3 or frame.shape[-1] != 3:  # 必须是3通道彩色帧
-        return False
-    h, w = frame.shape[:2]
-    if h < 100 or w < 100:  # 过滤极小无效帧
-        return False
-    if frame.nbytes < Config.FFMPEG_VALID_FRAME_MIN_SIZE:  # 过滤空帧（字节数过小）
-        return False
-    return True
 
 # ==================== 基础工具函数 ====================
 def calculate_iou(box1, box2):
@@ -226,75 +214,6 @@ def is_in_zone(box, zone):
         print(f"区域检查错误: {e}, box={box}, zone={zone}")
         return False
 
-def get_image_save_path(step_name):
-    """生成步骤验证图片的保存路径（跨平台）"""
-    try:
-        date_str = datetime.now().strftime("%Y%m%d")
-        time_str = datetime.now().strftime("%H%M%S")
-
-        dir_path = os.path.join(
-            Config.IMAGE_BASE_DIR,
-            Config.IMAGE_SUB_DIR.format(date=date_str, userid=state.user_id)
-        )
-
-        file_name = f"{step_name}_{time_str}.jpg"
-        full_path = os.path.join(dir_path, file_name)
-
-        os.makedirs(dir_path, exist_ok=True)
-        full_path = full_path.replace("\\", "/")
-        return full_path
-    except Exception as e:
-        print(f"生成图片路径失败: {e}")
-        fallback_path = os.path.join(Config.IMAGE_BASE_DIR, f"{step_name}_{int(time.time())}.jpg")
-        return fallback_path.replace("\\", "/")
-
-def get_video_save_path(user_id):
-    """生成考试视频的保存路径（跨平台）"""
-    try:
-        date_str = datetime.now().strftime("%Y%m%d")
-        time_str = datetime.now().strftime("%H%M%S")
-
-        dir_path = os.path.join(
-            Config.VIDEO_BASE_DIR,
-            Config.VIDEO_SUB_DIR.format(date=date_str, userid=user_id)
-        )
-
-        file_name = f"{user_id}_{time_str}.mp4"
-        full_path = os.path.join(dir_path, file_name)
-
-        os.makedirs(dir_path, exist_ok=True)
-        full_path = full_path.replace("\\", "/")
-        return full_path
-    except Exception as e:
-        print(f"生成视频路径失败: {e}")
-        fallback_path = os.path.join(Config.VIDEO_BASE_DIR, f"{user_id}_{int(time.time())}.mp4")
-        return fallback_path.replace("\\", "/")
-
-# ==================== 推理后端创建函数 =====================
-def create_inference_backend():
-    """工厂函数：根据配置创建对应的推理后端"""
-    backend = Config.INFERENCE_BACKEND.lower()
-
-    # 根据后端类型选择模型路径
-    if backend == "yolov8":
-        model_path = Config.YOLOV8_MODEL_PATH
-    elif backend == "ascend":
-        model_path = Config.ASCEND_OM_MODEL_PATH
-    elif backend == "rockchip":
-        model_path = Config.ROCKCHIP_MODEL_PATH
-    else:
-        model_path = Config.YOLOV8_MODEL_PATH  # 默认
-
-    return create_inference_engine(
-        backend=Config.INFERENCE_BACKEND,
-        model_path=model_path,
-        conf_threshold=Config.CONF_THRESHOLD,
-        recog_area=Config.RECOG_AREA,
-        names=LABEL_MAP,
-        device_id=Config.DEVICE_ID,
-        target=Config.ROCKCHIP_TARGET if backend == "rockchip" else None,
-        preprocess_mode=Config.ROCKCHIP_PREPROCESS_MODE if backend == "rockchip" else None
-    )
 
 # ==================== 对象跟踪模块 ====================
 class ObjectTracker:
@@ -479,8 +398,7 @@ class StepValidator:
         # 0. 处理无条件通过的步骤（步骤2、4）
         if req.get('always_pass', False):
             self._last_debug_log.append(f"步骤 {step_num} 无条件通过")
-            if req.get('return_false', False):
-                return False
+            # return_false: 内部仍返回True让步骤推进，由trigger_step回调时返回False给客户端
             return True
 
         # 1. 增强的类别检查（带置信度过滤和稳定性过滤）
@@ -718,71 +636,14 @@ class StepValidator:
     def _check_temporal_consistency(self, step_num, min_frames):
         """检查最近N帧的验证通过率，保证步骤稳定性
 
-        注意： 多帧确认已在check_step_logic_enhanced()中实现
+        注意： 多帧确认已在video_processor.check_step_logic_enhanced()中实现
         这里只做简单检查，避免循环依赖问题
         """
         # 简化逻辑： 只检查历史帧是否足够，不再检查通过率
-        # 多帧确认由外层的check_step_logic_enhanced()处理
+        # 多帧确认由外层的video_processor.check_step_logic_enhanced()处理
         if len(self.state.step_history) < min_frames:
             return True  # 历史帧不足时临时允许通过
         return True  # 始终返回True，让外层处理多帧确认
-
-# ==================== FFmpeg视频写入器（比OpenCV更稳定） ====================
-class FFmpegVideoWriter:
-    """FFmpeg子进程视频写入器，支持长时间录制，大文件稳定"""
-
-    def __init__(self, output_path, fps, width, height, codec='libx264'):
-        self.output_path = output_path
-        self.fps = fps
-        self.width = width
-        self.height = height
-        self.codec = codec
-        self.process = None
-        self._start_ffmpeg()
-
-    def _start_ffmpeg(self):
-        """启动FFmpeg子进程"""
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{self.width}x{self.height}',
-            '-pix_fmt', 'bgr24',
-            '-r', str(self.fps),
-            '-i', '-',
-            '-c:v', self.codec,
-            '-preset', 'fast',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            self.output_path
-        ]
-        try:
-            self.process = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except FileNotFoundError:
-            raise RuntimeError("ffmpeg未安装，请先安装: apt-get install ffmpeg")
-
-    def write(self, frame):
-        """写入一帧"""
-        if self.process and self.process.stdin:
-            try:
-                self.process.stdin.write(frame.tobytes())
-            except BrokenPipeError:
-                pass
-
-    def isOpened(self):
-        return self.process is not None and self.process.poll() is None
-
-    def release(self):
-        """关闭FFmpeg进程"""
-        if self.process:
-            try:
-                self.process.stdin.close()
-            except:
-                pass
-            self.process.wait(timeout=5)
-            self.process = None
 
 # ==================== 全局状态管理 ====================
 class GlobalState:
@@ -803,6 +664,8 @@ class GlobalState:
         self.step_completed = OrderedDict()
         self.frame_width = 0
         self.frame_height = 0
+        self.orig_size = None  # DVPP 路径原始分辨率 (src_h, src_w)，用于坐标缩放
+        self.dvpp_decoder = None  # DVPP 解码器引用，用于 PyAV remux 录制
         self.frame_id = 0
         self.latest_detections = []
         self.zones_cache = None
@@ -865,8 +728,8 @@ class GlobalState:
             tracker.objects.clear()
             tracker.next_id = 0
         # 同时重置推理子进程中的跟踪器
-        if inference_pipeline is not None:
-            inference_pipeline.request_reset()
+        if video_processor.get_inference_pipeline() is not None:
+            video_processor.get_inference_pipeline().request_reset()
 
     def hard_reset(self):
         """硬重置：清理所有状态，包括队列"""
@@ -946,681 +809,13 @@ STEP_ORDER = {
 # 关键安装步骤（用于拆卸顺序验证）
 CRITICAL_STEPS = [6, 7, 8, 9, 10, 11]
 
-# ==================== 检测核心逻辑 ====================
-def analyze_frame_with_tracking(frame):
-    """分析视频帧，执行推理+对象跟踪，返回带跟踪ID的检测结果"""
-    try:
-        boxes_list, vis_image, det_texts = state.inference_backend.infer(frame)
-
-        # 统一检测结果格式，映射类别名称
-        for box in boxes_list:
-            class_id = int(box["class"]) if isinstance(box["class"], (int, np.integer)) else 0
-            box["class_id"] = class_id
-            box["class"] = LABEL_MAP.get(class_id, f"类别_{class_id}")
-
-        # 执行对象跟踪，为检测目标分配唯一ID
-        tracked_detections = tracker.update(boxes_list)
-
-        # 更新全局检测缓冲
-        for det in tracked_detections:
-            track_id = det.get('track_id')
-            if track_id is not None:  # 修复：0也是有效的track_id
-                state.detection_buffer[track_id] = {
-                    'box': [det['x1'], det['y1'], det['x2'], det['y2']],
-                    'class': det['class'],
-                    'stable_count': tracker.objects.get(track_id, {}).get('stable_count', 0)
-                }
-
-        # 更新全局帧状态
-        state.frame_id += 1
-        state.latest_detections = tracked_detections
-        return tracked_detections, vis_image, det_texts
-    except Exception as e:
-        import traceback
-        print(f"推理失败: {e}")
-        traceback.print_exc()
-        return state.latest_detections, frame, []
-
-def check_step_logic_enhanced(detections, frame):
-    """
-    增强版步骤检查逻辑（使用StepValidator + 多帧确认机制）
-    核心改进：1. 使用StepValidator进行规范验证 2. 多帧连续确认避免误触发 3. 历史记录时间一致性
-    """
-    if not state.enable_detection:
-        # 仅首次打印一次
-        if not hasattr(check_step_logic_enhanced, '_warned'):
-            check_step_logic_enhanced._warned = True
-            print("[WARN] 步骤检测已禁用 (enable_detection=False)")
-        return
-    current_time = time.time()
-    # 检测频率控制，避免重复计算
-    if current_time - state.last_detection_time < Config.DETECTION_INTERVAL:
-        return
-    state.last_detection_time = current_time
-
-    # 使用本地帧计数器（避免多线程异步导致state.frame_id不递增）
-    if not hasattr(check_step_logic_enhanced, '_local_frame_count'):
-        check_step_logic_enhanced._local_frame_count = 0
-    check_step_logic_enhanced._local_frame_count += 1
-    local_frame_id = check_step_logic_enhanced._local_frame_count
-
-    step_to_trigger = None
-    with state.lock:
-        try:
-            current_step = state.current_step
-            step_num = current_step + 1  # 转换为1-indexed
-
-            # 记录当前帧验证结果到历史
-            frame_result = {
-                'frame_id': local_frame_id,
-                'timestamp': current_time,
-                'detections_count': len(detections),
-                f'step_{step_num}_valid': False
-            }
-
-            # 使用StepValidator进行实际验证
-            is_valid = step_validator.validate_step(step_num, detections, frame)
-            frame_result[f'step_{step_num}_valid'] = is_valid
-
-            # 添加到历史记录
-            state.step_history.append(frame_result)
-
-            # 多帧确认机制：检查是否有足够的连续有效帧
-            if is_valid:
-                min_stable_frames = step_validator.step_requirements.get(step_num, {}).get('min_stable_frames', 3)
-                recent_frames = list(state.step_history)[-min_stable_frames:]
-
-                if len(recent_frames) >= min_stable_frames:
-                    # 要求最近N帧全部验证通过（严格模式）
-                    consecutive_valid = all(
-                        h.get(f'step_{step_num}_valid', False)
-                        for h in recent_frames
-                    )
-
-                    if consecutive_valid:
-                        step_to_trigger = (step_num, True)
-                        # 关键日志：仅在步骤确认通过时打印
-                        print(f"[STEP] 步骤 {step_num} ({STEP_ORDER.get(step_num, '未知')}) 确认通过！连续{min_stable_frames}帧验证成功")
-
-            user_id = state.user_id
-        except Exception as e:
-            print(f"步骤检查异常: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # 触发步骤完成，保存结果并回调客户端
-    if step_to_trigger:
-        step_num, result = step_to_trigger
-        trigger_step(step_num, frame, result, user_id)
-        time.sleep(0.05)
-
-def trigger_step(step_num, frame, result, user_id):
-    """触发步骤完成，更新状态+保存验证图片+回调客户端"""
-    step_name = STEP_ORDER[step_num]
-    with state.lock:
-        if step_name in state.step_results and state.step_results[step_name] is not None:
-            return
-        # 更新步骤状态
-        state.step_results[step_name] = result
-        state.current_step = step_num
-        state.step_completed[step_name] = {
-            'time': time.time(),
-            'order': len(state.step_completed) + 1
-        }
-        # 生成步骤验证图片路径
-        img_path = get_image_save_path(step_name) if (result and frame is not None) else None
-
-    # 保存步骤验证图片
-    if img_path and frame is not None:
-        try:
-            cv2.imwrite(img_path, frame)
-            print(f"[OK] 步骤{step_num}验证图片已保存: {img_path}")
-        except Exception as e:
-            print(f"保存步骤图片失败: {e}")
-            img_path = None
-
-    # 异步回调客户端通知步骤完成
-    callback_sender.send_step_result(step_name, result, img_path, user_id)
-    print(f"[OK] 步骤 {step_num} ({step_name}) 完成: {'通过' if result else '未完成'}")
-
-def send_to_client(step_name, result, img_path, user_id):
-    """将步骤完成结果回调到客户端服务"""
-    try:
-        # 直接返回本地路径，客户端的BuildImageUri方法会自动转换为Nginx的HTTP URL
-        # 例如: D:/StepImages/YDPT/20260402/user/step.jpg -> http://{serverIp}:9003/YDPT/20260402/user/step.jpg
-        img_url = img_path if img_path else ""
-
-        # 构造客户端需要的回调数据格式
-        data = {
-            "userid": user_id,
-            "wearfanghu": False, "checkhuanjing": False, "weilanopen": False, "toolbag": False,
-            "checkjiaolun": False, "setjiaolun": False, "setjiaocha": False, "setjiaoshouban": False,
-            "setpati": False, "setanquandai": False, "setfanghulan": False, "chaichu": False,
-            "safetyopt": False, "weilanclose": False, "img_url": img_url
-        }
-        if step_name in data:
-            data[step_name] = result
-
-        # 发送POST请求到客户端
-        if Config.ENABLE_CLIENT_CALLBACK:
-            try:
-                response = requests.post(Config.STEP_CALLBACK_URL, json=data, timeout=3)
-                print(f"[ICON] 客户端步骤回调成功: {response.status_code}")
-            except Exception as e:
-                print(f"[ICON] 客户端步骤回调失败: {e}")
-        else:
-            print(f"[ICON] 模拟回调客户端: {step_name} = {result}, 图片路径={img_path}")
-    except Exception as e:
-        print(f"构造回调数据失败: {e}")
-
-def send_coordinates_to_client(coordinate_data, user_id):
-    """将检测目标坐标数据实时回调到客户端"""
-    if not state.is_recording or not state.enable_detection:
-        return
-    try:
-        coordinate_data["userid"] = user_id
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-        requests.post(
-            url=Config.COORDINATES_CALLBACK_URL,
-            json=coordinate_data,
-            headers=headers,
-            timeout=1
-        )
-    except requests.exceptions.ConnectionError:
-        pass
-    except requests.exceptions.Timeout:
-        pass
-    except Exception as e:
-        print(f"[ICON] 坐标数据回调异常: {str(e)}")
-
-class CallbackSender:
-    """异步回调发送器：专用线程+队列，解耦HTTP I/O与推理消费循环"""
-    def __init__(self, maxsize=100):
-        self._queue = queue.Queue(maxsize=maxsize)
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        while True:
-            try:
-                task = self._queue.get(timeout=0.5)
-                task_type = task[0]
-                if task_type == 'coord':
-                    _, data, user_id = task
-                    send_coordinates_to_client(data, user_id)
-                elif task_type == 'step':
-                    _, step_name, result, img_path, user_id = task
-                    send_to_client(step_name, result, img_path, user_id)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"[CallbackSender] 执行异常: {e}")
-
-    def _enqueue(self, task):
-        if self._queue.full():
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                pass
-        self._queue.put_nowait(task)
-
-    def send_coordinates(self, coordinate_data, user_id):
-        self._enqueue(('coord', coordinate_data, user_id))
-
-    def send_step_result(self, step_name, result, img_path, user_id):
-        self._enqueue(('step', step_name, result, img_path, user_id))
-
-callback_sender = CallbackSender()
-
-def build_csharp_coordinate_data(detections, device_type=1, recog_area=None):
-    """构造符合C#客户端要求的坐标数据格式"""
-    coord_arr = []
-    for det in detections:
-        x1, y1, x2, y2 = int(det["x1"]), int(det["y1"]), int(det["x2"]), int(det["y2"])
-        coord_arr.append({
-            "X1": x1, "Y1": y1, "X2": x2, "Y2": y2,
-            "Name": det["class"], "confidence": float(det["confidence"]),
-            "centerx": int((x1+x2)/2), "centery": int((y1+y2)/2)
-        })
-    result = {
-        "types": int(device_type),
-        "arr": coord_arr,
-        "userid": ""  # 后续由send_coordinates_to_client补充userid
-    }
-    # 添加检测区域字段
-    if recog_area:
-        result["recog_area"] = recog_area
-    return result
-
-# ==================== 推理Pipeline ====================
-
-def _inference_process_main(frame_queue, result_queue, running_event, reset_event, _unused=False):
-    """YOLOv8子进程：全流程推理+后处理+跟踪（spawn模式，绕过GIL）"""
-    try:
-        backend = create_inference_backend()
-        local_tracker = ObjectTracker(max_disappeared=3)
-        print(f"[OK] 推理子进程初始化完成 (PID: {os.getpid()})")
-    except Exception as e:
-        print(f"[ERR] 推理子进程初始化失败: {e}")
-        return
-
-    while running_event.is_set():
-        if reset_event.is_set():
-            local_tracker.objects.clear()
-            local_tracker.next_id = 0
-            reset_event.clear()
-        try:
-            frame = frame_queue.get(timeout=0.1)
-        except:
-            continue
-        try:
-            boxes_list, vis_image, _ = backend.infer(frame)
-            for box in boxes_list:
-                class_id = int(box["class"]) if isinstance(box["class"], (int, np.integer)) else 0
-                box["class_id"] = class_id
-                box["class"] = LABEL_MAP.get(class_id, f"类别_{class_id}")
-            tracked_detections = local_tracker.update(boxes_list)
-            for det in tracked_detections:
-                track_id = det.get('track_id')
-                if track_id is not None:
-                    det['stable_count'] = local_tracker.objects.get(track_id, {}).get('stable_count', 0)
-            try:
-                while result_queue.full():
-                    try: result_queue.get_nowait()
-                    except: break
-                result_queue.put_nowait((tracked_detections, vis_image))
-            except:
-                pass
-        except:
-            continue
-
-
-class InferencePipeline:
-    """推理Pipeline：YOLOv8用多进程，Ascend用多线程"""
-
-    def __init__(self):
-        self._is_thread_mode = Config.INFERENCE_BACKEND.lower() in ("ascend", "rockchip")
-        self._worker = None
-        self._result_thread = None
-
-        if self._is_thread_mode:
-            self.frame_queue = queue.Queue(maxsize=2)
-            self.result_queue = queue.Queue(maxsize=2)
-            self._running_flag = True
-            self._reset_flag = False
-        else:
-            self.frame_queue = mp.Queue(maxsize=2)
-            self.result_queue = mp.Queue(maxsize=2)
-            self._running = mp.Event()
-            self._reset_signal = mp.Event()
-
-    def start(self):
-        if self._is_thread_mode:
-            self._worker = threading.Thread(
-                target=self._ascend_worker, name="inference_worker", daemon=True
-            )
-        else:
-            self._running.set()
-            self._worker = mp.Process(
-                target=_inference_process_main,
-                args=(self.frame_queue, self.result_queue,
-                      self._running, self._reset_signal, False),
-                name="inference_spawn", daemon=True
-            )
-        self._worker.start()
-
-        self._result_thread = threading.Thread(
-            target=self._result_worker, name="result_worker", daemon=True
-        )
-        self._result_thread.start()
-
-        return "Ascend多线程" if self._is_thread_mode else f"YOLOv8多进程(PID={self._worker.pid})"
-
-    def submit_frame(self, frame):
-        try:
-            while self.frame_queue.full():
-                try: self.frame_queue.get_nowait()
-                except: break
-            if self._is_thread_mode:
-                self.frame_queue.put_nowait(frame.copy())
-            else:
-                self.frame_queue.put_nowait(frame)
-        except:
-            pass
-
-    def request_reset(self):
-        if self._is_thread_mode:
-            self._reset_flag = True
-        else:
-            self._reset_signal.set()
-
-    def _ascend_worker(self):
-        """Ascend：主进程中做推理+后处理+跟踪"""
-        global tracker
-        while self._running_flag:
-            if self._reset_flag:
-                if tracker is not None:
-                    tracker.objects.clear()
-                    tracker.next_id = 0
-                self._reset_flag = False
-            try:
-                frame = self.frame_queue.get(timeout=0.1)
-            except:
-                continue
-            try:
-                detections, vis_frame, det_texts = analyze_frame_with_tracking(frame)
-                state.latest_det_texts = det_texts
-                try:
-                    while self.result_queue.full():
-                        try: self.result_queue.get_nowait()
-                        except: break
-                    self.result_queue.put_nowait((detections, vis_frame))
-                except:
-                    pass
-            except:
-                continue
-
-    def _result_worker(self):
-        while True:
-            try:
-                detections, vis_frame = self.result_queue.get(timeout=0.1)
-                # 更新全局检测缓冲（关键：子进程的stable_count需要同步到主进程）
-                for det in detections:
-                    track_id = det.get('track_id')
-                    if track_id is not None:
-                        state.detection_buffer[track_id] = {
-                            'box': [det['x1'], det['y1'], det['x2'], det['y2']],
-                            'class': det['class'],
-                            'stable_count': det.get('stable_count', 0)
-                        }
-                state.latest_vis_frame = vis_frame
-                state.latest_detections = detections
-                if state.user_id and Config.ENABLE_CLIENT_CALLBACK:
-                    csharp_data = build_csharp_coordinate_data(detections, recog_area=Config.RECOG_AREA)
-                    callback_sender.send_coordinates(csharp_data, state.user_id)
-                check_step_logic_enhanced(detections, vis_frame)
-            except:
-                continue
-
-inference_pipeline = None
-
-# ==================== 视频流处理（FFmpeg PTS/断言修复版） ====================
-def stream_processor():
-    """
-    视频流核心处理线程 - 修复FFmpeg PTS时间戳错误/断言崩溃
-    核心改进：1. 全流程过滤无效帧 2. 帧计数严格递增保证PTS单调 3. 全局统一帧率 4. 精准帧间隔控制
-    """
-    cap = None
-    last_inference_frame_id = -1
-    TARGET_FPS = Config.VIDEO_WRITE_FPS  # 全局统一帧率
-    FRAME_INTERVAL = 1.0 / TARGET_FPS    # 帧间隔时间
-    last_frame_time = 0
-    write_frame_counter = 0              # 帧写入计数器（PTS严格递增核心）
-
-    # 本地录制状态缓存，减少全局锁竞争
-    local_is_recording = False
-    local_writer = None
-
-    while True:
-        try:
-            # 重新连接视频源
-            if cap is None or not cap.isOpened():
-                print(f"[VIDEO] 连接视频源: {Config.RTSP_URL}")
-                cap = cv2.VideoCapture(Config.RTSP_URL, cv2.CAP_FFMPEG)
-                if not cap.isOpened():
-                    print("[ERR] 视频源连接失败，5秒后重试...")
-                    time.sleep(5)
-                    continue
-                # 减小缓冲区降低延迟，OpenCV多核解码
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-                # 获取视频源分辨率
-                state.frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                state.frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                # 确认流处理帧率与全局一致
-                source_fps = cap.get(cv2.CAP_PROP_FPS)
-                TARGET_FPS = Config.VIDEO_WRITE_FPS
-                FRAME_INTERVAL = 1.0 / TARGET_FPS
-                print(f"[OK] 视频流连接成功: {state.frame_width}x{state.frame_height} | 源帧率: {source_fps:.1f}fps | 处理帧率: {TARGET_FPS:.1f}fps")
-                last_frame_time = time.time()
-                write_frame_counter = 0  # 重置写入计数器
-                state.frames_written = 0  # 同步全局计数为0，避免初始差1
-
-            # 精准控制帧间隔，避免帧堆积/丢失
-            current_time = time.time()
-            if current_time - last_frame_time < FRAME_INTERVAL:
-                time.sleep(FRAME_INTERVAL - (current_time - last_frame_time))
-                continue
-            last_frame_time = time.time()
-
-            # 读取帧并过滤无效帧（核心：避免FFmpeg断言）
-            ret, frame = cap.read()
-            if not ret or not is_valid_frame(frame):
-                if os.path.isfile(Config.RTSP_URL):
-                    print("[VIDEO] 视频文件播放完毕，重新播放...")
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    write_frame_counter = 0
-                    state.frames_written = 0  # 同步全局计数
-                    continue
-                else:
-                    print(f"[WARN]  获取无效帧/断帧，重新连接视频源...")
-                    cap.release()
-                    cap = None
-                    local_is_recording = False
-                    local_writer = None
-                    write_frame_counter = 0
-                    state.frames_written = 0  # 同步全局计数
-                    time.sleep(2)
-                    continue
-
-            # 放入推理队列（深拷贝避免帧被篡改）
-            try:
-                while state.frame_queue.full():
-                    state.frame_queue.get_nowait()
-                state.frame_queue.put_nowait(frame.copy())
-            except:
-                pass
-
-            # 通过Pipeline提交帧进行异步推理（多线程并行，充分利用多核CPU）
-            if state.inference_backend and state.is_recording and state.enable_detection and state.user_id:
-                if inference_pipeline is not None:
-                    inference_pipeline.submit_frame(frame)
-
-            # 放入显示队列（深拷贝）
-            try:
-                while state.display_queue.full():
-                    state.display_queue.get_nowait()
-                state.display_queue.put_nowait(frame.copy())
-            except:
-                pass
-
-            # 视频录制核心逻辑（FFmpeg PTS修复）
-            # 更新本地录制状态
-            if not local_is_recording or local_writer is None:
-                if state.is_recording and state.video_writer is not None and state.video_writer.isOpened():
-                    local_is_recording = True
-                    local_writer = state.video_writer
-                    write_frame_counter = 0
-                    state.frames_written = 0  # 启动录制时同步全局计数为0
-                    if Config.DEBUG_MODE:
-                        print(f"[REC] 录制已激活，帧计数器初始化: {write_frame_counter}")
-            # 严格写入有效帧，计数器递增保证PTS单调
-            if local_is_recording and local_writer is not None and local_writer.isOpened():
-                try:
-                    local_writer.write(frame)
-                    write_frame_counter += 1
-                    state.frames_written = write_frame_counter  # 写入成功后再同步，确保严格一致
-                    if Config.DEBUG_MODE and write_frame_counter % 100 == 0:
-                        print(f"[REC] 录制中：已写入{write_frame_counter}帧，PTS时序正常")
-                except Exception as e:
-                    print(f"[WARN]  帧写入失败（FFmpeg保护）: {e}")
-                    # 写入失败时不递增计数器，避免计数与实际帧不一致
-            # 停止录制时清理本地状态
-            if not state.is_recording and local_is_recording:
-                print(f"[REC] 录制停止，最后实际写入帧计数: {write_frame_counter}")
-                local_is_recording = False
-                local_writer = None
-                # 停止后不再重置计数器，仅同步最终值
-                state.frames_written = write_frame_counter
-
-        except Exception as e:
-            print(f"视频流处理错误: {e}")
-            import traceback
-            traceback.print_exc()
-            # 异常时重置所有状态
-            if cap:
-                cap.release()
-            cap = None
-            local_is_recording = False
-            local_writer = None
-            write_frame_counter = 0
-            state.frames_written = 0  # 异常时同步全局计数
-            time.sleep(5)
-
-def analyze_and_check(frame):
-    """后台异步执行：帧推理+步骤检查+坐标回调"""
-    try:
-        if not state.is_recording or not state.enable_detection:
-            return
-        # 执行推理和对象跟踪
-        detections, vis_frame, det_texts = analyze_frame_with_tracking(frame)
-        state.latest_det_texts = det_texts
-        state.latest_vis_frame = vis_frame
-        # 实时回调坐标数据到客户端
-        if state.user_id and Config.ENABLE_CLIENT_CALLBACK:
-            csharp_data = build_csharp_coordinate_data(detections, recog_area=Config.RECOG_AREA)
-            callback_sender.send_coordinates(csharp_data, state.user_id)
-        # 检查作业步骤逻辑
-        check_step_logic_enhanced(detections, vis_frame)
-    except Exception as e:
-        print(f"异步检测/步骤检查异常: {e}")
-
-def get_current_frame():
-    """从帧队列获取当前视频帧"""
-    try:
-        return state.frame_queue.get(timeout=1)
-    except:
-        return None
-
-# ==================== 浏览器实时视频流接口 ====================
-def generate_stream():
-    """生成浏览器可播放的MJPEG实时视频流"""
-    CONFIG_W, CONFIG_H = Config.CONFIG_WIDTH, Config.CONFIG_HEIGHT
-    last_frame_time = 0
-    TARGET_FPS = 15
-    JPEG_QUALITY = 80
-    STREAM_MAX_WIDTH = 960  # 板端缩小到960宽，减少Pillow转换和JPEG编码耗时
-    last_vis_frame = None
-
-    def get_cached_zones():
-        """获取缓存的区域配置，5秒刷新一次"""
-        current_time = time.time()
-        if state.zones_cache is None or current_time - state.zones_cache_timestamp > 5:
-            state.zones_cache = zone_manager.get_all_zones()
-            state.zones_cache_timestamp = current_time
-        return state.zones_cache
-
-    while True:
-        try:
-            # 帧率控制
-            current_time = time.time()
-            if current_time - last_frame_time < 1.0 / TARGET_FPS:
-                time.sleep(0.001)
-                continue
-            last_frame_time = current_time
-
-            # 获取可视化帧（优先使用推理后的帧，否则使用原始帧）
-            vis_frame = state.latest_vis_frame
-            if vis_frame is None:
-                frame = get_current_frame()
-                if frame is None:
-                    if last_vis_frame is not None:
-                        vis_frame = last_vis_frame
-                    else:
-                        time.sleep(0.05)
-                        continue
-                else:
-                    vis_frame = frame.copy()
-            last_vis_frame = vis_frame.copy()
-
-            # 板端性能优化：缩小分辨率后再渲染文字和编码JPEG
-            if vis_frame.shape[1] > STREAM_MAX_WIDTH:
-                scale = STREAM_MAX_WIDTH / vis_frame.shape[1]
-                vis_frame = cv2.resize(vis_frame, (STREAM_MAX_WIDTH, int(vis_frame.shape[0] * scale)),
-                                       interpolation=cv2.INTER_LINEAR)
-
-            # 叠加检测区域到视频流 - 先用cv2画矩形框（快），中文文字收集后一次性Pillow渲染
-            all_zones = get_cached_zones()
-            frame_h, frame_w = vis_frame.shape[:2]
-            scale_x = frame_w / CONFIG_W if CONFIG_W > 0 else 1.0
-            scale_y = frame_h / CONFIG_H if CONFIG_H > 0 else 1.0
-
-            # 收集所有需要渲染的中文文字（检测标签 + 区域名 + 状态信息）
-            all_texts = []
-
-            # 1. 推理引擎的检测标签（已按原图坐标，需缩放到stream尺寸）
-            if vis_frame.shape[1] != 1920 and state.latest_det_texts:
-                text_scale = vis_frame.shape[1] / 1920
-                for tx, ty, label, color in state.latest_det_texts:
-                    all_texts.append((int(tx * text_scale), int(ty * text_scale), label, color))
-            else:
-                all_texts.extend(state.latest_det_texts)
-
-            # 2. 区域名称和边框
-            for zone_type, zones in all_zones.items():
-                for zone in zones:
-                    try:
-                        coords = zone['coords']
-                        color = tuple(zone.get('color', [0, 255, 0]))
-                        x1, y1 = int(coords[0]*scale_x), int(coords[1]*scale_y)
-                        x2, y2 = int(coords[2]*scale_x), int(coords[3]*scale_y)
-                        # 绘制半透明区域背景
-                        overlay = vis_frame.copy()
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-                        cv2.addWeighted(overlay, 0.1, vis_frame, 0.9, 0, vis_frame)
-                        # 绘制区域边框
-                        cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 2)
-                        all_texts.append((x1, max(15, y1-5), f"{zone['name']} ({zone_type})", color))
-                    except:
-                        pass
-
-            # 3. 跟踪ID（纯英文，cv2即可）
-            for det in state.latest_detections:
-                track_id = det.get('track_id')
-                if track_id:
-                    x1, y1 = det['x1'], det['y1']
-                    if vis_frame.shape[1] != 1920:
-                        ts = vis_frame.shape[1] / 1920
-                        x1, y1 = int(x1*ts), int(y1*ts)
-                    cv2.putText(vis_frame, f"ID:{track_id}", (x1, y1-5),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
-
-            # 4. 状态信息
-            status_text = f"当前步骤:{state.current_step} | 录制:{state.is_recording} | 已写帧数:{state.frames_written}"
-            all_texts.append((10, 30, status_text, (0, 255, 0)))
-
-            # 一次性 Pillow 渲染所有中文文字（只做1次BGR→RGB→PIL→RGB→BGR转换）
-            render_chinese_texts(vis_frame, all_texts, _PIL_FONT)
-
-            # 编码为JPEG格式
-            encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-            _, buffer = cv2.imencode('.jpg', vis_frame, encode_params)
-            frame_bytes = buffer.tobytes()
-
-            # 生成MJPEG流格式
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        except Exception as e:
-            print(f"视频流生成错误: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(0.5)
 
 @app.route('/stream')
 def video_stream():
     """浏览器实时视频流入口"""
     if not Config.ENABLE_STREAMING:
         return jsonify({"error": "视频流功能未启用"}), 403
-    return Response(generate_stream(),
+    return Response(video_processor.generate_stream(),
                    mimetype='multipart/x-mixed-replace; boundary=frame',
                    headers={
                        'Cache-Control': 'no-cache',
@@ -1814,8 +1009,8 @@ def start():
             state.frames_written = 0
 
             # 获取有效视频帧，确认分辨率
-            frame = get_current_frame()
-            if frame is None or not is_valid_frame(frame):
+            frame = video_processor.get_current_frame()
+            if frame is None or not video_processor.is_valid_frame(frame):
                 return jsonify({"error": "无法从视频源获取有效帧"}), 500
             h, w = frame.shape[:2]
             state.frame_width = w
@@ -1824,31 +1019,43 @@ def start():
             # 视频录制（根据配置开关决定是否启用）
             video_path = None
             WRITE_FPS = Config.VIDEO_WRITE_FPS
+            use_dvpp_recorder = (state.dvpp_decoder is not None and
+                                 hasattr(state.dvpp_decoder, 'start_record'))
             if Config.ENABLE_RECORDING:
-                video_path = get_video_save_path(user_id)
-                try:
-                    writer = FFmpegVideoWriter(video_path, WRITE_FPS, w, h, codec='libx264')
-                    print(f"[OK] FFmpeg编码器初始化成功，帧率: {WRITE_FPS:.1f}fps")
-                except Exception as e:
-                    print(f"[ERR] FFmpeg初始化失败: {e}，回退到OpenCV")
-                    writer = None
-                    codecs_to_try = [('mp4v', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')]
-                    for codec, ext in codecs_to_try:
-                        try:
-                            fourcc = cv2.VideoWriter_fourcc(*codec)
-                            video_path_ext = video_path.replace('.mp4', ext)
-                            writer = cv2.VideoWriter(video_path_ext, fourcc, WRITE_FPS, (w, h))
-                            if writer.isOpened():
-                                print(f"[OK] OpenCV编码器 {codec} 初始化成功")
-                                video_path = video_path_ext
-                                break
-                        except Exception as e2:
-                            print(f"[WARN]  编码器 {codec} 初始化失败: {e2}")
-                            writer = None
-                            continue
-                if writer is None or not writer.isOpened():
-                    return jsonify({"error": "所有编码器均无法使用，无法创建视频写入器"}), 500
-                state.video_writer = writer
+                video_path = video_processor.get_video_save_path(user_id)
+                if use_dvpp_recorder:
+                    # DVPP 模式：PyAV remux 录制（零 CPU 编码，保留原始分辨率）
+                    try:
+                        state.dvpp_decoder.start_record(video_path)
+                        print(f"[OK] PyAV remux 录制启动: {video_path}")
+                    except Exception as e:
+                        print(f"[ERR] PyAV remux 录制启动失败: {e}")
+                        use_dvpp_recorder = False
+                if not use_dvpp_recorder:
+                    # CPU 模式或 DVPP 录制失败回退：FFmpegVideoWriter / OpenCV
+                    try:
+                        writer = video_processor.FFmpegVideoWriter(video_path, WRITE_FPS, w, h, codec='libx264')
+                        print(f"[OK] FFmpeg编码器初始化成功，帧率: {WRITE_FPS:.1f}fps")
+                    except Exception as e:
+                        print(f"[ERR] FFmpeg初始化失败: {e}，回退到OpenCV")
+                        writer = None
+                        codecs_to_try = [('mp4v', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')]
+                        for codec, ext in codecs_to_try:
+                            try:
+                                fourcc = cv2.VideoWriter_fourcc(*codec)
+                                video_path_ext = video_path.replace('.mp4', ext)
+                                writer = cv2.VideoWriter(video_path_ext, fourcc, WRITE_FPS, (w, h))
+                                if writer.isOpened():
+                                    print(f"[OK] OpenCV编码器 {codec} 初始化成功")
+                                    video_path = video_path_ext
+                                    break
+                            except Exception as e2:
+                                print(f"[WARN]  编码器 {codec} 初始化失败: {e2}")
+                                writer = None
+                                continue
+                    if writer is None or not writer.isOpened():
+                        return jsonify({"error": "所有编码器均无法使用，无法创建视频写入器"}), 500
+                    state.video_writer = writer
             else:
                 print(f"[INFO] 视频录制已禁用 (enable_recording=false)")
 
@@ -1859,10 +1066,11 @@ def start():
             state.video_path = video_path
 
             # 打印开始考试信息
+            rec_mode = "PyAV remux" if use_dvpp_recorder else Config.VIDEO_CODEC
             print(f"="*50)
             print(f"[OK] 考试已启动: user_id={user_id}")
             print(f"[VIDEO] 视频路径: {video_path} | 分辨率: {w}x{h}")
-            print(f"[REC] 编码器: {Config.VIDEO_CODEC} | 帧率: {WRITE_FPS:.1f}fps")
+            print(f"[REC] 录制模式: {rec_mode} | 帧率: {WRITE_FPS:.1f}fps")
             print(f"="*50)
 
         # 返回成功响应
@@ -1902,24 +1110,34 @@ def stop():
             state.enable_detection = False
             # 缓存需要关闭的写入器和视频信息
             writer_to_close = state.video_writer
+            decoder_to_stop = state.dvpp_decoder if (state.dvpp_decoder is not None and
+                                                       hasattr(state.dvpp_decoder, 'is_recording') and
+                                                       state.dvpp_decoder.is_recording) else None
             video_path = state.video_path
-            written_frames = state.frames_written  # 直接用全局已同步的计数，避免差1
+            written_frames = state.frames_written
 
-        # ========== 核心修改：删除空帧写入，仅等待编码器缓存刷盘，不产生额外PTS ==========
-        if writer_to_close and writer_to_close.isOpened():
+        # DVPP 模式：停止 PyAV remux 录制
+        if decoder_to_stop is not None:
+            try:
+                rec_mp4 = decoder_to_stop.stop_record()
+                if rec_mp4:
+                    video_path = rec_mp4
+                print(f"[OK] PyAV remux 录制停止: {rec_mp4}")
+            except Exception as e:
+                print(f"[ERR] PyAV remux 录制停止异常: {e}")
+
+        # CPU 模式：等待编码器缓存刷盘并释放写入器
+        if writer_to_close and hasattr(writer_to_close, 'isOpened') and writer_to_close.isOpened():
             print(f"[ICON] 等待FFmpeg编码器缓存刷盘（超时{Config.FFMPEG_FLUSH_TIMEOUT}秒）...")
             try:
-                # 仅等待，不写入任何帧，避免PTS重复
                 time.sleep(Config.FFMPEG_FLUSH_TIMEOUT)
                 print(f"[OK] FFmpeg编码器缓存刷盘完成，无额外帧写入")
             except Exception as e:
                 print(f"[WARN]  缓存刷盘警告: {e}（不影响视频完整性）")
 
-        # 安全释放视频写入器（优化：先判断是否打开，再释放）
         if writer_to_close:
             try:
-                if writer_to_close.isOpened():
-                    # 核心：先停止写入，再释放，避免编码器报错
+                if hasattr(writer_to_close, 'isOpened') and writer_to_close.isOpened():
                     writer_to_close.release()
                 state.video_writer = None
                 print(f"[VIDEO] 视频写入器已安全关闭（无FFmpeg断言/PTS错误）")
@@ -1931,11 +1149,10 @@ def stop():
         file_size = 0
         if video_path and os.path.exists(video_path):
             file_size = os.path.getsize(video_path)
-            print(f"[VIDEO] 考试视频: {video_path} | 大小: {file_size:,} 字节 | 实际写入帧数: {written_frames}")
-            # 有效文件判断：大小>1MB 且 写入帧数>0
-            if file_size > 1024 * 1024 and written_frames > 0:
+            print(f"[VIDEO] 考试视频: {video_path} | 大小: {file_size:,} 字节")
+            # PyAV remux 模式无 frames_written 计数，用文件大小判断
+            if file_size > 100 * 1024:  # >100KB 即视为有效
                 file_valid = True
-                # ========== 优化：判断ffprobe是否存在，不存在则跳过验证，不打印警告 ==========
                 ffprobe_path = shutil.which("ffprobe")
                 if ffprobe_path:
                     try:
@@ -1946,14 +1163,18 @@ def stop():
                         if result.returncode == 0:
                             probe_data = json.loads(result.stdout)
                             duration = float(probe_data.get('format', {}).get('duration', 0))
-                            actual_fps = eval(probe_data['streams'][0]['r_frame_rate'])
-                            print(f"[OK] 视频验证成功: 时长 {duration:.2f}秒 | 实际帧率 {actual_fps:.1f}fps | PTS时序正常")
+                            streams = probe_data.get('streams', [])
+                            if streams:
+                                actual_fps = eval(streams[0]['r_frame_rate'])
+                                print(f"[OK] 视频验证成功: 时长 {duration:.2f}秒 | 实际帧率 {actual_fps:.1f}fps")
+                            else:
+                                print(f"[OK] 视频验证成功: 时长 {duration:.2f}秒")
                     except Exception as e:
                         print(f"[WARN]  ffprobe验证警告: {e}（视频文件可正常播放）")
                 else:
                     print(f"[INFO]  未检测到ffprobe，跳过视频时序验证（视频可正常播放）")
             else:
-                print(f"[WARN]  视频文件无效：大小过小或无有效帧写入")
+                print(f"[WARN]  视频文件无效：大小过小")
 
         # 保存步骤结果并软重置状态
         with state.lock:
@@ -1963,7 +1184,7 @@ def stop():
         # 打印结束考试信息
         print(f"="*50)
         print(f"[STOP] 考试已结束: user_id={user_id}")
-        print(f"[INFO] 实际写入帧数: {written_frames} | 文件有效: {file_valid}")
+        print(f"[INFO] 文件有效: {file_valid} | 文件大小: {file_size:,} 字节")
         print(f"="*50)
 
         # 返回结束考试结果
@@ -2028,11 +1249,11 @@ def ydpt_sseboxes():
 def get_boxes():
     """GET接口：获取当前帧的检测目标坐标"""
     try:
-        frame = get_current_frame()
-        if frame is None or not is_valid_frame(frame):
+        frame = video_processor.get_current_frame()
+        if frame is None or not video_processor.is_valid_frame(frame):
             return jsonify({"error": "暂无有效视频帧"}), 500
         # 执行推理和跟踪，返回最新检测结果
-        detections, _, _ = analyze_frame_with_tracking(frame)
+        detections, _, _ = video_processor.analyze_frame_with_tracking(frame)
         # 获取当前帧分辨率，计算自适应检测区域
         orig_h, orig_w = frame.shape[:2]
         current_resolution = (orig_w, orig_h)
@@ -2215,8 +1436,20 @@ def debug_step_validation(step_num):
 def initialize_service():
     """服务全局初始化，加载模型/跟踪器/验证器，启动流处理线程"""
     try:
+        # 0. 初始化视频帧处理模块（注入依赖，必须在所有video_processor调用之前）
+        # 注意：tracker/step_validator尚未创建，后续通过setter更新
+        global tracker, step_validator
+        tracker = None
+        step_validator = None
+        video_processor.init_video_processor(
+            config=Config, state=state, label_map=LABEL_MAP,
+            step_order=STEP_ORDER, critical_steps=CRITICAL_STEPS,
+            tracker=tracker, step_validator=step_validator,
+            zone_manager=zone_manager
+        )
+
         # 1. 配置FFmpeg环境（核心修复PTS/断言）
-        setup_ffmpeg_env()
+        video_processor.setup_ffmpeg_env()
         # 2. 动态获取视频源实际帧率，全局统一
         print(f"\n[VIDEO] 检测视频源实际帧率...")
         temp_cap = cv2.VideoCapture(Config.RTSP_URL, cv2.CAP_FFMPEG)
@@ -2243,7 +1476,7 @@ def initialize_service():
 
         # 4. 初始化推理后端
         print(f"\n[BOX] 初始化推理后端...")
-        state.inference_backend = create_inference_backend()
+        state.inference_backend = video_processor.create_inference_backend()
         backend_info = state.inference_backend.get_model_info()
         print(f"[OK] 推理后端初始化成功: {backend_info}")
         # 验证模型文件是否存在
@@ -2255,9 +1488,11 @@ def initialize_service():
             return False
 
         # 5. 初始化全局对象跟踪器和步骤验证器
-        global tracker, step_validator
         tracker = ObjectTracker(max_disappeared=3)
         step_validator = StepValidator(state)
+        # 更新 video_processor 中的 tracker/step_validator 引用
+        video_processor._tracker = tracker
+        video_processor._step_validator = step_validator
         print(f"[OK] 对象跟踪器初始化成功 | 最大消失帧数: 3")
         print(f"[OK] 步骤验证引擎初始化成功 | 共{len(step_validator.step_requirements)}个步骤规则")
 
@@ -2310,14 +1545,14 @@ def initialize_service():
             print(f"[ERR] 警告：所有编码器测试失败，视频录制功能可能不可用")
 
         # 8. 启动推理Pipeline（按后端自动选择多进程/多线程）
-        global inference_pipeline
-        inference_pipeline = InferencePipeline()
-        mode = inference_pipeline.start()
+        pipeline = video_processor.InferencePipeline()
+        video_processor.set_inference_pipeline(pipeline)
+        mode = pipeline.start()
         print(f"[OK] 推理Pipeline启动成功 [{mode}]")
 
         # 9. 启动视频流处理线程
         print(f"\n[START] 启动视频流处理线程...")
-        state.streaming_thread = threading.Thread(target=stream_processor, daemon=True)
+        state.streaming_thread = threading.Thread(target=video_processor.stream_processor, daemon=True)
         state.streaming_thread.start()
 
         # 10. 打印服务访问信息

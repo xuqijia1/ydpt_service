@@ -236,25 +236,19 @@ class BaseInferenceEngine:
         self.names = names or {}
         self._infer_count = 0
 
-    def infer(self, image):
+    def infer(self, image, orig_size=None):
         """
         执行推理
 
         Args:
             image: BGR 格式图片 (numpy array)
+            orig_size: (orig_h, orig_w) 原始分辨率。
+                      DVPP 硬解码时 image 已 resize 到 640x640，
+                      传 orig_size=(1080,1920) 使坐标缩放回原始分辨率。
+                      None 时用 image.shape[:2]。
 
         Returns:
             tuple: (boxes_list, vis_image)
-                boxes_list: 检测框列表，每个元素为字典:
-                    {
-                        'x1': int,          # 原图 x1 坐标
-                        'y1': int,          # 原图 y1 坐标
-                        'x2': int,          # 原图 x2 坐标
-                        'y2': int,          # 原图 y2 坐标
-                        'class': int,       # 类别 ID
-                        'confidence': float # 置信度
-                    }
-                vis_image: 可视化图像
         """
         raise NotImplementedError
 
@@ -266,13 +260,13 @@ class BaseInferenceEngine:
         """设置置信度阈值"""
         self.conf_threshold = conf_threshold
 
-    def _get_adaptive_recog_area(self, image_shape):
+    def _get_adaptive_recog_area(self, orig_size):
         """获取自适应检测区域"""
-        h, w = image_shape[:2]
-        current_resolution = (w, h)
+        orig_h, orig_w = orig_size
+        current_resolution = (orig_w, orig_h)
         if self.recog_area:
             return get_adaptive_recog_area(self.recog_area, self.CONFIG_RESOLUTION, current_resolution)
-        return [0, 0, w, h]
+        return [0, 0, orig_w, orig_h]
 
     def _filter_by_recog_area(self, boxes, recog_area):
         """按检测区域过滤检测框"""
@@ -340,15 +334,18 @@ class CUDAInferenceEngine(BaseInferenceEngine):
         except Exception as e:
             raise RuntimeError(f"[CUDAInferenceEngine] 模型加载失败: {e}")
 
-    def infer(self, image):
+    def infer(self, image, orig_size=None):
         """执行推理，返回检测结果和可视化图像"""
         t0 = time.time()
 
         # 获取图片尺寸
-        orig_h, orig_w = image.shape[:2]
+        if orig_size is not None:
+            orig_h, orig_w = orig_size
+        else:
+            orig_h, orig_w = image.shape[:2]
 
         # 自适应检测区域
-        recog_area = self._get_adaptive_recog_area(image.shape)
+        recog_area = self._get_adaptive_recog_area((orig_h, orig_w))
         recog_x1, recog_y1, recog_x2, recog_y2 = recog_area
 
         # 推理（YOLO内部会自动处理resize，保持宽高比）
@@ -442,9 +439,12 @@ class AscendInferenceEngine(BaseInferenceEngine):
         except Exception as e:
             raise RuntimeError(f"[AscendInferenceEngine] 模型加载失败: {e}")
 
-    def _preprocess(self, image):
+    def _preprocess(self, image, orig_size=None):
         """预处理：letterbox 保持宽高比 resize 到 640x640 + 归一化"""
-        orig_h, orig_w = image.shape[:2]
+        if orig_size is not None:
+            orig_h, orig_w = orig_size
+        else:
+            orig_h, orig_w = image.shape[:2]
 
         # letterbox: 保持宽高比缩放，用灰色填充
         scale = min(640 / orig_w, 640 / orig_h)
@@ -470,19 +470,22 @@ class AscendInferenceEngine(BaseInferenceEngine):
         self._input_buffer[0] = img_float.transpose(2, 0, 1)
         return self._input_buffer
 
-    def infer(self, image):
+    def infer(self, image, orig_size=None):
         """执行推理，返回检测结果和可视化图像"""
         t0 = time.time()
 
         # 获取图片尺寸
-        orig_h, orig_w = image.shape[:2]
+        if orig_size is not None:
+            orig_h, orig_w = orig_size
+        else:
+            orig_h, orig_w = image.shape[:2]
 
         # 自适应检测区域
-        recog_area = self._get_adaptive_recog_area(image.shape)
+        recog_area = self._get_adaptive_recog_area((orig_h, orig_w))
         recog_x1, recog_y1, recog_x2, recog_y2 = recog_area
 
         # 预处理
-        input_data = self._preprocess(image)
+        input_data = self._preprocess(image, orig_size=orig_size)
 
         # 推理
         outputs = self.session.infer([input_data])
@@ -495,11 +498,9 @@ class AscendInferenceEngine(BaseInferenceEngine):
 
         self._infer_count += 1
         # 仅在检测数量变化时打印关键日志（减少刷屏）
-        if self._infer_count % 100 == 0:
+        if self._infer_count <= 3 or self._infer_count % 100 == 0:
             elapsed = (time.time() - t0) * 1000
-            # 只在检测到目标时打印
-            if len(boxes) > 0:
-                print(f"[AscendInferenceEngine] 推理耗时: {elapsed:.1f}ms | 检测: {len(boxes)}个")
+            print(f"[AscendInferenceEngine] orig_size={orig_size} image_shape={image.shape[:2]} 推理耗时: {elapsed:.1f}ms | 检测: {len(boxes)}个")
 
         return boxes, vis_image, det_texts
 
@@ -605,10 +606,12 @@ class AscendInferenceEngine(BaseInferenceEngine):
         }
 
     def release(self):
-        """释放资源"""
+        """释放资源（不销毁 ACL context，避免破坏同 device 上 VDEC 的运行时状态）"""
         if self.session is not None:
-            del self.session
+            # 只置 None，不 del。InferSession 析构可能调 destroy_context
+            # 破坏同 device 上 VDEC 通道的 ACL 运行时状态
             self.session = None
+        self._input_buffer = None
         print("[AscendInferenceEngine] 资源已释放")
 
 
@@ -709,19 +712,22 @@ class RockchipInferenceEngine(BaseInferenceEngine):
         self._input_buffer[0] = img_rgb
         return self._input_buffer
 
-    def infer(self, image):
+    def infer(self, image, orig_size=None):
         """执行推理，返回检测结果和可视化图像"""
         t0 = time.time()
 
         # 获取图片尺寸
-        orig_h, orig_w = image.shape[:2]
+        if orig_size is not None:
+            orig_h, orig_w = orig_size
+        else:
+            orig_h, orig_w = image.shape[:2]
 
         # 自适应检测区域
-        recog_area = self._get_adaptive_recog_area(image.shape)
+        recog_area = self._get_adaptive_recog_area((orig_h, orig_w))
         recog_x1, recog_y1, recog_x2, recog_y2 = recog_area
 
         # 预处理
-        input_data = self._preprocess(image)
+        input_data = self._preprocess(image, orig_size=orig_size)
 
         # 推理
         outputs = self.rknn.inference(inputs=[input_data])
