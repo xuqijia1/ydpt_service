@@ -267,14 +267,20 @@ def create_inference_backend():
         names=_label_map,
         device_id=_config.DEVICE_ID,
         target=_config.ROCKCHIP_TARGET if backend == "rockchip" else None,
-        preprocess_mode=_config.ROCKCHIP_PREPROCESS_MODE if backend == "rockchip" else None
+        preprocess_mode=_config.ROCKCHIP_PREPROCESS_MODE if backend == "rockchip" else None,
+        aipp=getattr(_config, 'ASCEND_AIPP', False)
     )
 
 
 # ==================== 检测核心逻辑 ====================
 
 def analyze_frame_with_tracking(frame):
-    """分析视频帧，执行推理+对象跟踪，返回带跟踪ID的检测结果"""
+    """分析视频帧，执行推理+对象跟踪，返回带跟踪ID的检测结果
+
+    Args:
+        frame: BGR numpy 数组，或 AIPP 模式下的 device buffer dict
+               dict: {'buffer': dev_nv12_ptr, 'size': int}
+    """
     try:
         boxes_list, vis_image, det_texts = _state.inference_backend.infer(frame, orig_size=getattr(_state, 'orig_size', None))
         for box in boxes_list:
@@ -603,7 +609,11 @@ class InferencePipeline:
                 try: self.frame_queue.get_nowait()
                 except: break
             if self._is_thread_mode:
-                self.frame_queue.put_nowait(frame.copy())
+                # AIPP 模式下 frame 是 device buffer dict，不需要 copy
+                if isinstance(frame, dict):
+                    self.frame_queue.put_nowait(frame)
+                else:
+                    self.frame_queue.put_nowait(frame.copy())
             else:
                 self.frame_queue.put_nowait(frame)
         except:
@@ -616,7 +626,12 @@ class InferencePipeline:
             self._reset_signal.set()
 
     def _ascend_worker(self):
-        """Ascend：主进程中做推理+后处理+跟踪"""
+        """Ascend：主进程中做推理+后处理+跟踪
+
+        AIPP 模式下，frame_queue 中的 item 可能是：
+        - numpy array (BGR 帧，非 AIPP 模式)
+        - dict {'buffer': dev_ptr, 'size': int} (NV12 device buffer，AIPP 零拷贝)
+        """
         global _tracker
         while self._running_flag:
             if self._reset_flag:
@@ -629,6 +644,7 @@ class InferencePipeline:
             except:
                 continue
             try:
+                # frame 可能是 numpy array 或 AIPP device buffer dict，直接传给推理引擎
                 detections, vis_frame, det_texts = analyze_frame_with_tracking(frame)
                 _state.latest_det_texts = det_texts
                 try:
@@ -642,6 +658,7 @@ class InferencePipeline:
                 continue
 
     def _result_worker(self):
+        use_aipp = getattr(_config, 'ASCEND_AIPP', False)
         while True:
             try:
                 detections, vis_frame = self.result_queue.get(timeout=0.1)
@@ -653,7 +670,10 @@ class InferencePipeline:
                             'class': det['class'],
                             'stable_count': det.get('stable_count', 0)
                         }
-                _state.latest_vis_frame = vis_frame
+                # AIPP 模式下 vis_frame 是黑色零数组，不覆盖 latest_vis_frame
+                # generate_stream() 会从 frame_queue 拿 BGR 帧并自己画框
+                if not use_aipp:
+                    _state.latest_vis_frame = vis_frame
                 _state.latest_detections = detections
                 if _state.user_id and _config.ENABLE_CLIENT_CALLBACK:
                     csharp_data = build_csharp_coordinate_data(detections, recog_area=_config.RECOG_AREA)
@@ -751,7 +771,11 @@ def _stream_processor_cv():
 
 
 def _stream_processor_dvpp():
-    """视频流处理 - DVPP 硬解码路径（自动降级到 CPU 软解码）"""
+    """视频流处理 - DVPP 硬解码路径（自动降级到 CPU 软解码）
+
+    AIPP 模式下使用 read_frame_device_nv12() 零拷贝推理，
+    非 AIPP 模式使用 read_frame() BGR 帧推理。
+    """
     from dvpp_decoder import create_dvpp_decoder
     decoder = None
     TARGET_FPS = _config.VIDEO_WRITE_FPS
@@ -762,6 +786,7 @@ def _stream_processor_dvpp():
     local_writer = None
     reconnect_count = 0
     max_reconnect = getattr(_config, 'DVPP_MAX_RECONNECT', 3)
+    use_aipp = getattr(_config, 'ASCEND_AIPP', False)
 
     while True:
         try:
@@ -796,8 +821,9 @@ def _stream_processor_dvpp():
                 TARGET_FPS = _config.VIDEO_WRITE_FPS
                 FRAME_INTERVAL = 1.0 / TARGET_FPS
                 decoder_type = type(decoder).__name__
+                aipp_str = " | AIPP零拷贝" if use_aipp else ""
                 print(f"[OK] DVPP 硬解码连接成功: {decoder.width}x{decoder.height} | "
-                      f"解码器: {decoder_type} | 处理帧率: {TARGET_FPS:.1f}fps")
+                      f"解码器: {decoder_type}{aipp_str} | 处理帧率: {TARGET_FPS:.1f}fps")
                 last_frame_time = time.time()
                 write_frame_counter = 0
                 _state.frames_written = 0
@@ -808,26 +834,70 @@ def _stream_processor_dvpp():
                 continue
             last_frame_time = time.time()
 
-            frame = decoder.read_frame()
-            if frame is None:
-                print("[WARN] DVPP 读取帧失败，重新连接...")
-                _cleanup_dvpp(decoder)
-                decoder = None
-                _state.dvpp_decoder = None
-                reconnect_count += 1
-                local_is_recording = False
-                local_writer = None
-                write_frame_counter = 0
-                _state.frames_written = 0
-                if reconnect_count < max_reconnect:
-                    time.sleep(2)
-                continue
-            if not is_valid_frame(frame):
-                continue
+            if use_aipp:
+                # AIPP 零拷贝路径：同时获取 NV12 device buffer（推理）和 BGR 帧（显示/录制）
+                nv12_info, bgr_frame = decoder.read_frame_aipp()
+                if nv12_info is None:
+                    print("[WARN] DVPP AIPP 读取帧失败，重新连接...")
+                    _cleanup_dvpp(decoder)
+                    decoder = None
+                    _state.dvpp_decoder = None
+                    reconnect_count += 1
+                    local_is_recording = False
+                    local_writer = None
+                    write_frame_counter = 0
+                    _state.frames_written = 0
+                    if reconnect_count < max_reconnect:
+                        time.sleep(2)
+                    continue
 
-            _dispatch_frame(frame, write_frame_counter, local_is_recording, local_writer)
-            local_is_recording, local_writer, write_frame_counter = \
-                _handle_recording(frame, local_is_recording, local_writer, write_frame_counter)
+                # AIPP 模式：提交 device buffer 给推理管线（零拷贝）
+                if _state.inference_backend and _state.is_recording and _state.enable_detection and _state.user_id:
+                    if _inference_pipeline is not None:
+                        try:
+                            while _inference_pipeline.frame_queue.full():
+                                try: _inference_pipeline.frame_queue.get_nowait()
+                                except: break
+                            _inference_pipeline.frame_queue.put_nowait(nv12_info)
+                        except:
+                            pass
+
+                # BGR 帧用于显示和录制
+                if bgr_frame is not None:
+                    try:
+                        while _state.frame_queue.full():
+                            _state.frame_queue.get_nowait()
+                        _state.frame_queue.put_nowait(bgr_frame.copy())
+                    except:
+                        pass
+                    try:
+                        while _state.display_queue.full():
+                            _state.display_queue.get_nowait()
+                        _state.display_queue.put_nowait(bgr_frame.copy())
+                    except:
+                        pass
+            else:
+                # 非 AIPP 路径：读取 BGR 帧
+                frame = decoder.read_frame()
+                if frame is None:
+                    print("[WARN] DVPP 读取帧失败，重新连接...")
+                    _cleanup_dvpp(decoder)
+                    decoder = None
+                    _state.dvpp_decoder = None
+                    reconnect_count += 1
+                    local_is_recording = False
+                    local_writer = None
+                    write_frame_counter = 0
+                    _state.frames_written = 0
+                    if reconnect_count < max_reconnect:
+                        time.sleep(2)
+                    continue
+                if not is_valid_frame(frame):
+                    continue
+
+                _dispatch_frame(frame, write_frame_counter, local_is_recording, local_writer)
+                local_is_recording, local_writer, write_frame_counter = \
+                    _handle_recording(frame, local_is_recording, local_writer, write_frame_counter)
 
         except Exception as e:
             print(f"DVPP 视频流处理错误: {e}")
@@ -964,13 +1034,18 @@ def get_current_frame(max_wait=5):
 
 
 def generate_stream():
-    """生成浏览器可播放的MJPEG实时视频流"""
+    """生成浏览器可播放的MJPEG实时视频流
+
+    AIPP 模式下：latest_vis_frame 不更新，从 frame_queue 取 BGR 帧自己画框
+    非 AIPP 模式下：用 latest_vis_frame（推理引擎已画好框）
+    """
     CONFIG_W, CONFIG_H = _config.CONFIG_WIDTH, _config.CONFIG_HEIGHT
     last_frame_time = 0
     TARGET_FPS = 15
     JPEG_QUALITY = 80
     STREAM_MAX_WIDTH = 960
     last_vis_frame = None
+    use_aipp = getattr(_config, 'ASCEND_AIPP', False)
 
     def get_cached_zones():
         current_time = time.time()
@@ -987,17 +1062,51 @@ def generate_stream():
                 continue
             last_frame_time = current_time
 
-            vis_frame = _state.latest_vis_frame
-            if vis_frame is None:
-                frame = get_current_frame()
+            if use_aipp:
+                # AIPP 模式：从 frame_queue 取 BGR 帧，自己画检测框
+                frame = get_current_frame(max_wait=0.5)
                 if frame is None:
                     if last_vis_frame is not None:
-                        vis_frame = last_vis_frame
+                        vis_frame = last_vis_frame.copy()
                     else:
                         time.sleep(0.05)
                         continue
                 else:
                     vis_frame = frame.copy()
+                # 画检测框（坐标基于原始分辨率，需缩放到 vis_frame 尺寸）
+                detections = _state.latest_detections
+                orig_size = getattr(_state, 'orig_size', None)
+                if orig_size is not None:
+                    orig_h, orig_w = orig_size
+                else:
+                    orig_h, orig_w = vis_frame.shape[:2]
+                det_texts = []
+                for det in detections:
+                    x1, y1, x2, y2 = det['x1'], det['y1'], det['x2'], det['y2']
+                    # 原始分辨率坐标 → vis_frame 坐标
+                    sx = vis_frame.shape[1] / orig_w
+                    sy = vis_frame.shape[0] / orig_h
+                    fx1, fy1 = int(x1 * sx), int(y1 * sy)
+                    fx2, fy2 = int(x2 * sx), int(y2 * sy)
+                    class_id = det.get('class_id', 0)
+                    color = CLASS_COLORS.get(class_id, (0, 255, 0))
+                    cv2.rectangle(vis_frame, (fx1, fy1), (fx2, fy2), color, 2)
+                    label = f"{det.get('class', '')} {det.get('confidence', 0):.2f}"
+                    det_texts.append((fx1, max(15, fy1-5), label, color))
+            else:
+                # 非 AIPP 模式：用推理引擎画好框的 vis_frame
+                vis_frame = _state.latest_vis_frame
+                if vis_frame is None:
+                    frame = get_current_frame()
+                    if frame is None:
+                        if last_vis_frame is not None:
+                            vis_frame = last_vis_frame
+                        else:
+                            time.sleep(0.05)
+                            continue
+                    else:
+                        vis_frame = frame.copy()
+                det_texts = None  # 使用 _state.latest_det_texts
             last_vis_frame = vis_frame.copy()
 
             if vis_frame.shape[1] > STREAM_MAX_WIDTH:
@@ -1012,12 +1121,27 @@ def generate_stream():
 
             all_texts = []
 
-            if vis_frame.shape[1] != 1920 and _state.latest_det_texts:
-                text_scale = vis_frame.shape[1] / 1920
-                for tx, ty, label, color in _state.latest_det_texts:
-                    all_texts.append((int(tx * text_scale), int(ty * text_scale), label, color))
+            if use_aipp:
+                # AIPP 模式：det_texts 坐标已在 vis_frame 尺寸上，需缩放到显示分辨率
+                # vis_frame 已被 resize 到 STREAM_MAX_WIDTH，所以按比例缩放
+                if det_texts and last_vis_frame is not None:
+                    # vis_frame 已 resize，det_texts 坐标基于 resize 前的 vis_frame
+                    pre_scale = vis_frame.shape[1] / last_vis_frame.shape[1] if last_vis_frame.shape[1] != vis_frame.shape[1] else 1.0
+                    if abs(pre_scale - 1.0) > 0.01:
+                        all_texts.extend([(int(tx * pre_scale), int(ty * pre_scale), label, color)
+                                          for tx, ty, label, color in det_texts])
+                    else:
+                        all_texts.extend(det_texts)
+                else:
+                    all_texts.extend(det_texts)
             else:
-                all_texts.extend(_state.latest_det_texts)
+                # 非 AIPP 模式：使用推理引擎的 det_texts
+                if vis_frame.shape[1] != 1920 and _state.latest_det_texts:
+                    text_scale = vis_frame.shape[1] / 1920
+                    for tx, ty, label, color in _state.latest_det_texts:
+                        all_texts.append((int(tx * text_scale), int(ty * text_scale), label, color))
+                else:
+                    all_texts.extend(_state.latest_det_texts)
 
             for zone_type, zones in all_zones.items():
                 for zone in zones:
@@ -1038,7 +1162,12 @@ def generate_stream():
                 track_id = det.get('track_id')
                 if track_id:
                     x1, y1 = det['x1'], det['y1']
-                    if vis_frame.shape[1] != 1920:
+                    # 坐标基于原始分辨率，缩放到当前 vis_frame 尺寸
+                    if use_aipp and orig_size is not None:
+                        oh, ow = orig_size
+                        x1 = int(x1 * vis_frame.shape[1] / ow)
+                        y1 = int(y1 * vis_frame.shape[0] / oh)
+                    elif vis_frame.shape[1] != 1920:
                         ts = vis_frame.shape[1] / 1920
                         x1, y1 = int(x1*ts), int(y1*ts)
                     cv2.putText(vis_frame, f"ID:{track_id}", (x1, y1-5),

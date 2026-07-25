@@ -408,7 +408,7 @@ class CUDAInferenceEngine(BaseInferenceEngine):
 class AscendInferenceEngine(BaseInferenceEngine):
     """Ascend NPU 推理引擎"""
 
-    def __init__(self, model_path, conf_threshold=0.5, recog_area=None, names=None, device_id=0):
+    def __init__(self, model_path, conf_threshold=0.5, recog_area=None, names=None, device_id=0, aipp=False):
         """
         初始化 Ascend 推理引擎
 
@@ -418,26 +418,140 @@ class AscendInferenceEngine(BaseInferenceEngine):
             recog_area: 检测区域
             names: 类别名称映射
             device_id: Ascend 设备 ID
+            aipp: True=模型已插入 AIPP，输入为 NV12 device buffer（零拷贝）
         """
         super().__init__(model_path, conf_threshold, recog_area, names)
         self.device_id = device_id
+        self.aipp = aipp
         self._init_model()
 
     def _init_model(self):
         """初始化模型"""
         try:
-            from ais_bench.infer.interface import InferSession
+            if self.aipp:
+                # AIPP 零拷贝：用原生 acl API，直接绑定 device buffer 推理
+                import acl
+                ret = acl.init()
+                if ret != 0 and ret != 1 and ret != 100002:
+                    raise RuntimeError(f"acl.init 失败: ret={ret}")
+                acl.rt.set_device(self.device_id)
+                self._model_id, ret = acl.mdl.load_from_file(self.model_path)
+                if ret != 0:
+                    raise RuntimeError(f"acl.mdl.load_from_file 失败: ret={ret}")
+                self._model_desc = acl.mdl.create_desc()
+                acl.mdl.get_desc(self._model_desc, self._model_id)
 
-            self.session = InferSession(self.device_id, self.model_path)
+                # 预分配输出 dataset（复用，不每帧重建）
+                output_count = acl.mdl.get_num_outputs(self._model_desc)
+                self._output_dataset = acl.mdl.create_dataset()
+                self._output_sizes = []
+                self._output_dev_bufs = []
+                for i in range(output_count):
+                    buf_size = acl.mdl.get_output_size_by_index(self._model_desc, i)
+                    self._output_sizes.append(buf_size)
+                    dev_buf, ret = acl.rt.malloc(buf_size, 2)  # ACL_MEM_MALLOC_NORMAL_ONLY
+                    if ret != 0:
+                        raise RuntimeError(f"输出 buffer malloc 失败: ret={ret}")
+                    self._output_dev_bufs.append(dev_buf)
+                    data_buf = acl.create_data_buffer(dev_buf, buf_size)
+                    acl.mdl.add_dataset_buffer(self._output_dataset, data_buf)
 
-            # 预分配输入缓冲区
-            self._input_buffer = np.zeros((1, 3, 640, 640), dtype=np.float32)
+                # 获取输出 shape（用于 numpy reshape）
+                self._output_dims = []
+                for i in range(output_count):
+                    dims, ret = acl.mdl.get_cur_output_dims(self._model_desc, i)
+                    self._output_dims.append(dims['dims'])
 
-            print(f"[AscendInferenceEngine] 模型加载成功: {self.model_path} | 设备: {self.device_id}")
+                print(f"[AscendInferenceEngine/AIPP] 零拷贝模型加载成功: {self.model_path} | 设备: {self.device_id}")
+            else:
+                # 非 AIPP：继续用 ais_bench
+                from ais_bench.infer.interface import InferSession
+                self.session = InferSession(self.device_id, self.model_path)
+                self._input_buffer = np.zeros((1, 3, 640, 640), dtype=np.float32)
+                print(f"[AscendInferenceEngine] 模型加载成功: {self.model_path} | 设备: {self.device_id}")
         except ImportError:
             raise RuntimeError("[AscendInferenceEngine] ais_bench 未安装，无法使用 Ascend 模式")
         except Exception as e:
             raise RuntimeError(f"[AscendInferenceEngine] 模型加载失败: {e}")
+
+    def _execute_zero_copy(self, dev_ptr, dev_size):
+        """零拷贝推理：直接用 device NV12 buffer 作为输入，不走 D2H/H2D
+
+        Args:
+            dev_ptr: device NV12 buffer 指针（来自 VPC resize 输出）
+            dev_size: buffer 大小（640*640*1.5 = 614400）
+
+        Returns:
+            list[numpy.ndarray]: 输出张量列表，或 None（推理失败）
+        """
+        import acl
+
+        acl.rt.set_device(self.device_id)
+
+        # 创建输入 dataset（每帧新建，绑定当前帧的 device buffer）
+        input_dataset = acl.mdl.create_dataset()
+        input_buf = acl.create_data_buffer(dev_ptr, dev_size)
+        _, ret = acl.mdl.add_dataset_buffer(input_dataset, input_buf)
+        if ret != 0:
+            acl.destroy_data_buffer(input_buf)
+            acl.mdl.destroy_dataset(input_dataset)
+            return None
+
+        # 执行推理（输入零拷贝，输出用预分配 dataset）
+        ret = acl.mdl.execute(self._model_id, input_dataset, self._output_dataset)
+
+        # 销毁输入 dataset（不释放 device buffer，它属于 VPC 预分配的 _dev_rsz_nv12）
+        num_bufs = acl.mdl.get_dataset_num_buffers(input_dataset)
+        for i in range(num_bufs):
+            buf = acl.mdl.get_dataset_buffer(input_dataset, i)
+            acl.destroy_data_buffer(buf)
+        acl.mdl.destroy_dataset(input_dataset)
+
+        if ret != 0:
+            print(f"[AIPP-DBG] execute 失败 ret={ret}")
+            return None
+
+        # 读取输出（D2H，后处理需要 numpy）
+        outputs = []
+        for i in range(len(self._output_sizes)):
+            buf = acl.mdl.get_dataset_buffer(self._output_dataset, i)
+            out_ptr = acl.get_data_buffer_addr(buf)
+            out_size = acl.get_data_buffer_size_v2(buf)
+            host_ptr, _ = acl.rt.malloc_host(out_size)
+            acl.rt.memcpy(host_ptr, out_size, int(out_ptr), out_size, 2)
+            bytes_data = acl.util.ptr_to_bytes(host_ptr, out_size)
+            raw = np.frombuffer(bytes_data, dtype=np.float32)
+            try:
+                result = raw.reshape(tuple(self._output_dims[i]))
+            except Exception:
+                result = raw
+            if result.ndim == 2:
+                result = result[np.newaxis, :]
+            outputs.append(result)
+            acl.rt.free_host(host_ptr)
+
+        return outputs
+
+    def cleanup(self):
+        """释放 AIPP 模式的 acl 资源（模型切换/退出时调用）"""
+        if not self.aipp:
+            return
+        try:
+            import acl
+            if hasattr(self, '_output_dataset'):
+                num = acl.mdl.get_dataset_num_buffers(self._output_dataset)
+                for i in range(num):
+                    buf = acl.mdl.get_dataset_buffer(self._output_dataset, i)
+                    acl.destroy_data_buffer(buf)
+                acl.mdl.destroy_dataset(self._output_dataset)
+            for dev_buf in getattr(self, '_output_dev_bufs', []):
+                acl.rt.free(dev_buf)
+            if hasattr(self, '_model_id'):
+                acl.mdl.unload(self._model_id)
+            if hasattr(self, '_model_desc'):
+                acl.mdl.destroy_desc(self._model_desc)
+        except Exception as e:
+            print(f"[AscendInferenceEngine] cleanup 警告: {e}")
 
     def _preprocess(self, image, orig_size=None):
         """预处理：letterbox 保持宽高比 resize 到 640x640 + 归一化"""
@@ -471,8 +585,38 @@ class AscendInferenceEngine(BaseInferenceEngine):
         return self._input_buffer
 
     def infer(self, image, orig_size=None):
-        """执行推理，返回检测结果和可视化图像"""
+        """执行推理，返回检测结果和可视化图像
+
+        Args:
+            image: BGR numpy 数组，或 AIPP 模式下的 device buffer dict
+                   AIPP dict: {'buffer': dev_nv12_ptr, 'size': int}
+            orig_size: (orig_h, orig_w) 原始分辨率，None 时用 image.shape[:2]
+        """
         t0 = time.time()
+
+        # AIPP 零拷贝路径：直接用 device NV12 buffer 推理，无 D2H/H2D
+        if self.aipp and isinstance(image, dict):
+            if orig_size is None:
+                orig_h, orig_w = 1080, 1920
+            else:
+                orig_h, orig_w = orig_size
+
+            recog_area = self._get_adaptive_recog_area((orig_h, orig_w))
+
+            outputs = self._execute_zero_copy(image['buffer'], image['size'])
+            if outputs is None:
+                return [], np.zeros((640,640,3), dtype=np.uint8), []
+
+            # AIPP 模式：VPC 直接 resize 到 640x640（非 letterbox），坐标按比例还原
+            boxes = self._postprocess_aipp(outputs[0], orig_w, orig_h, recog_area)
+
+            # AIPP 模式无 BGR 图像用于可视化，返回空帧
+            vis_image = np.zeros((640, 640, 3), dtype=np.uint8)
+            det_texts = []
+
+            self._infer_count += 1
+
+            return boxes, vis_image, det_texts
 
         # 获取图片尺寸
         if orig_size is not None:
@@ -498,7 +642,7 @@ class AscendInferenceEngine(BaseInferenceEngine):
 
         self._infer_count += 1
         # 仅在检测数量变化时打印关键日志（减少刷屏）
-        if self._infer_count <= 3 or self._infer_count % 100 == 0:
+        if self._infer_count % 100 == 0:
             elapsed = (time.time() - t0) * 1000
             print(f"[AscendInferenceEngine] orig_size={orig_size} image_shape={image.shape[:2]} 推理耗时: {elapsed:.1f}ms | 检测: {len(boxes)}个")
 
@@ -596,6 +740,89 @@ class AscendInferenceEngine(BaseInferenceEngine):
 
         return boxes
 
+    def _postprocess_aipp(self, output, orig_w, orig_h, recog_area):
+        """AIPP 模式后处理：VPC 直接 resize 到 640x640（非 letterbox），坐标按比例还原"""
+        predictions = output[0]
+
+        if len(predictions.shape) == 3:
+            predictions = predictions[0]
+
+        if predictions.shape[0] < predictions.shape[1]:
+            predictions = predictions.transpose(1, 0)
+
+        det_boxes = predictions[:, :4]
+        scores = predictions[:, 4:]
+
+        if scores.max() > 1.0:
+            scores = 1 / (1 + np.exp(-np.clip(scores, -500, 500)))
+
+        max_scores = np.max(scores, axis=1)
+        class_ids = np.argmax(scores, axis=1)
+
+        mask = max_scores >= self.conf_threshold
+        if not np.any(mask):
+            return []
+
+        filtered_boxes = det_boxes[mask]
+        filtered_scores = max_scores[mask]
+        filtered_classes = class_ids[mask]
+
+        # xywh -> xyxy（在 640x640 坐标系）
+        cx, cy, bw, bh = filtered_boxes.T
+        x1_640 = cx - bw / 2
+        y1_640 = cy - bh / 2
+        x2_640 = cx + bw / 2
+        y2_640 = cy + bh / 2
+
+        # AIPP 模式：VPC 直接 resize（非 letterbox），坐标按比例还原
+        scale_x = orig_w / 640
+        scale_y = orig_h / 640
+        x1_orig = x1_640 * scale_x
+        y1_orig = y1_640 * scale_y
+        x2_orig = x2_640 * scale_x
+        y2_orig = y2_640 * scale_y
+
+        # NMS：按类别分组
+        unique_classes = np.unique(filtered_classes)
+        keep_indices = []
+
+        for cls_id in unique_classes:
+            cls_mask = filtered_classes == cls_id
+            cls_boxes = np.column_stack((x1_orig[cls_mask], y1_orig[cls_mask], x2_orig[cls_mask], y2_orig[cls_mask]))
+            cls_scores = filtered_scores[cls_mask]
+
+            cls_keep = nms(cls_boxes, cls_scores, iou_threshold=0.45)
+            global_indices = np.where(cls_mask)[0][cls_keep]
+            keep_indices.extend(global_indices)
+
+        if not keep_indices:
+            return []
+
+        recog_x1, recog_y1, recog_x2, recog_y2 = recog_area
+        boxes = []
+
+        for idx in keep_indices:
+            orig_x1 = int(x1_orig[idx])
+            orig_y1 = int(y1_orig[idx])
+            orig_x2 = int(x2_orig[idx])
+            orig_y2 = int(y2_orig[idx])
+
+            center_x = (orig_x1 + orig_x2) / 2
+            center_y = (orig_y1 + orig_y2) / 2
+            if center_x < recog_x1 or center_y < recog_y1 or center_x > recog_x2 or center_y > recog_y2:
+                continue
+
+            boxes.append({
+                'x1': orig_x1,
+                'y1': orig_y1,
+                'x2': orig_x2,
+                'y2': orig_y2,
+                'class': int(filtered_classes[idx]),
+                'confidence': float(filtered_scores[idx])
+            })
+
+        return boxes
+
     def get_model_info(self):
         """获取模型信息"""
         return {
@@ -607,10 +834,11 @@ class AscendInferenceEngine(BaseInferenceEngine):
 
     def release(self):
         """释放资源（不销毁 ACL context，避免破坏同 device 上 VDEC 的运行时状态）"""
-        if self.session is not None:
-            # 只置 None，不 del。InferSession 析构可能调 destroy_context
-            # 破坏同 device 上 VDEC 通道的 ACL 运行时状态
-            self.session = None
+        if self.aipp:
+            self.cleanup()
+        else:
+            if self.session is not None:
+                self.session = None
         self._input_buffer = None
         print("[AscendInferenceEngine] 资源已释放")
 
@@ -859,7 +1087,7 @@ class RockchipInferenceEngine(BaseInferenceEngine):
 
 # ===================== 工厂函数 =====================
 
-def create_inference_engine(backend, model_path, conf_threshold=0.5, recog_area=None, names=None, device_id=0, target=None, preprocess_mode=None):
+def create_inference_engine(backend, model_path, conf_threshold=0.5, recog_area=None, names=None, device_id=0, target=None, preprocess_mode=None, aipp=False):
     """
     创建推理引擎
 
@@ -872,13 +1100,14 @@ def create_inference_engine(backend, model_path, conf_threshold=0.5, recog_area=
         device_id: 设备 ID
         target: 目标芯片型号 (仅 Rockchip 使用，如 'rk3567')
         preprocess_mode: 预处理模式 (仅 Rockchip 使用: 'non_quant'/'quant')
+        aipp: True=Ascend 模型已插入 AIPP，零拷贝推理
 
     Returns:
         推理引擎实例
     """
     backend_lower = backend.lower()
     if backend_lower == 'ascend':
-        return AscendInferenceEngine(model_path, conf_threshold, recog_area, names, device_id)
+        return AscendInferenceEngine(model_path, conf_threshold, recog_area, names, device_id, aipp=aipp)
     elif backend_lower == 'rockchip':
         return RockchipInferenceEngine(model_path, conf_threshold, recog_area, names, device_id, target, preprocess_mode)
     else:

@@ -614,7 +614,7 @@ class AclVdecDecoder(BaseVideoDecoder):
                 pic_data = acl.media.dvpp_get_pic_desc_data(pic_desc)
                 pic_size = acl.media.dvpp_get_pic_desc_size(pic_desc)
 
-                if ret_code == 0 and pic_data is not None and pic_size > 0 and user_data is not None and user_data >= 0:
+                if ret_code <= 1 and pic_data is not None and pic_size > 0 and user_data is not None and user_data >= 0:
                     # 有效图像帧 — 入队列，主线程用完 dvpp_free
                     try:
                         self._frame_queue.put_nowait({"buffer": pic_data, "size": pic_size})
@@ -1296,6 +1296,137 @@ class AclVdecDecoder(BaseVideoDecoder):
             'height': self._target_h,
             'vdec_buffer': frame_info["buffer"],  # 主线程用完 dvpp_free
         }
+
+    def read_frame_device_nv12(self):
+        """读取一帧 NV12 device buffer (VPC resize 后，用于 AIPP 零拷贝推理)
+
+        与 read_frame_device() 不同，此方法使用预分配的 _dev_rsz_nv12 buffer，
+        不需要调用方 dvpp_free，适合 AIPP 零拷贝推理（device buffer 复用）。
+
+        Returns:
+            dict: {'buffer': dev_nv12_ptr, 'size': int} 或 None
+        """
+        if not self._started:
+            return None
+
+        if not self._demux_running:
+            if not self._reconnect_demux():
+                return None
+
+        if self._ctx is not None:
+            acl.rt.set_context(self._ctx)
+        else:
+            acl.rt.set_device(self.device_id)
+
+        self._demux_and_send(max_frames=2)
+        self._flush_desc_queue()
+
+        frame_info = self._get_decoded_frame(timeout=0.5)
+        if frame_info is None:
+            return None
+
+        dev_nv12, nv12_size = self._vpc_resize_nv12(
+            frame_info["buffer"], frame_info["size"])
+
+        acl.media.dvpp_free(frame_info["buffer"])
+
+        if dev_nv12 is None:
+            return None
+
+        return {
+            'buffer': dev_nv12,
+            'size': nv12_size,
+        }
+
+    def read_frame_aipp(self):
+        """读取一帧，同时返回 NV12 device buffer（AIPP 零拷贝推理）和 BGR 帧（显示/录制）
+
+        一次 VDEC 解码 + VPC 处理，同时产出：
+        1. NV12 device buffer（预分配 _dev_rsz_nv12，零拷贝给推理引擎）
+        2. BGR numpy 帧（VPC convert_color + D2H，用于 MJPEG 显示和录制）
+
+        Returns:
+            tuple: (nv12_dict, bgr_frame)
+                nv12_dict: {'buffer': dev_nv12_ptr, 'size': int} 或 None
+                bgr_frame: BGR numpy (640, 640, 3) 或 None
+        """
+        if not self._started:
+            return None, None
+
+        if not self._demux_running:
+            if not self._reconnect_demux():
+                return None, None
+
+        if self._ctx is not None:
+            acl.rt.set_context(self._ctx)
+        else:
+            acl.rt.set_device(self.device_id)
+
+        for attempt in range(3):
+            self._demux_and_send(max_frames=2)
+            self._flush_desc_queue()
+
+            frame_info = self._get_decoded_frame(timeout=0.5)
+            if frame_info is not None:
+                # Step 1: VPC crop_resize NV12→640x640 NV12
+                vpc_in = acl.media.dvpp_create_pic_desc()
+                acl.media.dvpp_set_pic_desc_data(vpc_in, frame_info["buffer"])
+                acl.media.dvpp_set_pic_desc_format(vpc_in, FMT_NV12)
+                acl.media.dvpp_set_pic_desc_width(vpc_in, self._width)
+                acl.media.dvpp_set_pic_desc_height(vpc_in, self._height)
+                vdec_w = _align_up(self._width, 16)
+                vdec_h = _align_up(self._height, 2)
+                acl.media.dvpp_set_pic_desc_width_stride(vpc_in, vdec_w)
+                acl.media.dvpp_set_pic_desc_height_stride(vpc_in, vdec_h)
+                acl.media.dvpp_set_pic_desc_size(vpc_in, frame_info["size"])
+
+                acl.rt.memset(int(self._dev_rsz_nv12), self._rsz_nv12_size,
+                              0, self._rsz_nv12_size)
+                ret = acl.media.dvpp_vpc_crop_resize_async(
+                    self._vpc_ch, vpc_in, self._rsz_nv12_desc,
+                    self._roi, self._resize_cfg, self._vpc_stream)
+                acl.rt.synchronize_stream(self._vpc_stream)
+                acl.media.dvpp_destroy_pic_desc(vpc_in)
+
+                if ret != 0:
+                    acl.media.dvpp_free(frame_info["buffer"])
+                    if attempt == 0:
+                        print(f"[AclVdec] AIPP VPC crop_resize 失败: ret={ret}")
+                    continue
+
+                # Step 2: VPC convert_color NV12→BGR
+                acl.rt.memset(int(self._dev_bgr), self._bgr_size,
+                              0, self._bgr_size)
+                ret = acl.media.dvpp_vpc_convert_color_async(
+                    self._vpc_ch, self._rsz_nv12_desc, self._bgr_desc, self._vpc_stream)
+                acl.rt.synchronize_stream(self._vpc_stream)
+
+                # 释放 VDEC 原始 buffer（VPC resize 已完成，不再需要）
+                acl.media.dvpp_free(frame_info["buffer"])
+
+                if ret != 0:
+                    if attempt == 0:
+                        print(f"[AclVdec] AIPP VPC convert_color 失败: ret={ret}")
+                    continue
+
+                # Step 3: D2H BGR
+                bgr_buf = np.zeros(self._bgr_size, dtype=np.uint8)
+                acl.rt.memcpy(int(bgr_buf.ctypes.data), self._bgr_size,
+                              int(self._dev_bgr), self._bgr_size, ACL_D2H)
+                bgr = bgr_buf[:self._target_h * self._bgr_w_stride].reshape(
+                    self._target_h, self._bgr_w_stride // 3, 3)[:, :self._target_w, :].copy()
+
+                nv12_dict = {
+                    'buffer': self._dev_rsz_nv12,
+                    'size': self._rsz_nv12_size,
+                }
+                return nv12_dict, bgr
+
+            else:
+                if attempt == 0 and self._frame_count <= 5:
+                    print(f"[AclVdec] AIPP 超时: cb={self._vdec_cb_count} nal_q={self._nal_queue.qsize()}")
+
+        return None, None
 
     # ==================== 软复位 ====================
 

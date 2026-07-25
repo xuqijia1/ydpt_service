@@ -140,6 +140,7 @@ class Config:
     DVPP_OUT_FORMAT = global_config.get("dvpp", {}).get("out_format", "NV12")
     DVPP_AUTO_DETECT_CODEC = global_config.get("dvpp", {}).get("auto_detect_codec", True)
     DVPP_MAX_RECONNECT = global_config.get("dvpp", {}).get("max_reconnect_attempts", 3)
+    ASCEND_AIPP = global_config.get("dvpp", {}).get("ascend_aipp", False)
 
     # ==================== 服务部署配置（新增！关键修复） ====================
     SERVICE_PORT = global_config["service"]["port"]          # 服务端口
@@ -1470,9 +1471,6 @@ def initialize_service():
         print(f"YOLO模型: {Config.YOLOV8_MODEL_PATH} | 昇腾模型: {Config.ASCEND_OM_MODEL_PATH}")
         print(f"视频源: {Config.RTSP_URL} | 录制帧率: {Config.VIDEO_WRITE_FPS:.1f}fps")
         print(f"配置页面: {Config.CONFIG_WIDTH}x{Config.CONFIG_HEIGHT} | 背景图: {Config.CONFIG_BACKGROUND_IMAGE}")
-        print(f"\n[LIST] 检测类别标签映射:")
-        for i, label in LABEL_MAP.items():
-            print(f"  {i:2d}: {label}")
 
         # 4. 初始化推理后端
         print(f"\n[BOX] 初始化推理后端...")

@@ -71,6 +71,7 @@ dvpp:
   out_format: "NV12"         # 输出格式：BGR（直出，部分设备不支持）/ NV12（需转换，兼容性好）
   auto_detect_codec: true    # 自动检测 RTSP 流编码格式（覆盖 en_type 配置）
   max_reconnect_attempts: 3  # DVPP 连续重连失败次数，超过后降级到 CPU 软解码
+  ascend_aipp: false         # 启用 AIPP 零拷贝推理（需 OM 模型用 --insert_op_conf=aipp.cfg 转换）
 
 # ==================== 服务部署配置 ====================
 service:

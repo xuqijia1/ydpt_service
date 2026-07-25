@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
         "out_format": "NV12",
         "auto_detect_codec": True,
         "max_reconnect_attempts": 3,
+        "ascend_aipp": False,
     },
     "service": {
         "port": 5010,
