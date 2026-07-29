@@ -16,6 +16,7 @@ import multiprocessing as mp
 from datetime import datetime
 from collections import OrderedDict
 
+from exam_state import ExamState
 from inference_engine import (
     create_inference_engine, draw_detection_boxes,
     render_chinese_texts, CLASS_COLORS, _PIL_FONT
@@ -308,10 +309,10 @@ def analyze_frame_with_tracking(frame):
 
 def check_step_logic_enhanced(detections, frame):
     """增强版步骤检查逻辑（使用StepValidator + 多帧确认机制）"""
-    if not _state.enable_detection:
+    if _state.exam_state != ExamState.RUNNING:
         if not hasattr(check_step_logic_enhanced, '_warned'):
             check_step_logic_enhanced._warned = True
-            print("[WARN] 步骤检测已禁用 (enable_detection=False)")
+            print("[WARN] 步骤检测已禁用 (exam_state != RUNNING)")
         return
     current_time = time.time()
     if current_time - _state.last_detection_time < _config.DETECTION_INTERVAL:
@@ -419,7 +420,7 @@ def send_to_client(step_name, result, img_path, user_id):
 
 def send_coordinates_to_client(coordinate_data, user_id):
     """将检测目标坐标数据实时回调到客户端"""
-    if not _state.is_recording or not _state.enable_detection:
+    if _state.exam_state != ExamState.RUNNING:
         return
     try:
         coordinate_data["userid"] = user_id
@@ -694,6 +695,19 @@ def set_inference_pipeline(pipeline):
     _inference_pipeline = pipeline
 
 
+# DVPP 强制重连事件（由 /start 在帧获取失败时触发）
+_force_reconnect_event = threading.Event()
+
+
+def force_reconnect_dvpp():
+    """请求 DVPP 解码器强制完整重连（soft_reset 不足以恢复长时间空闲后的死连接）
+
+    由 /start 在 get_current_frame 失败后调用，立即清零 reconnect_count
+    并触发 video_processor 线程重建解码器。
+    """
+    _force_reconnect_event.set()
+
+
 # ==================== 视频流处理 ====================
 
 def _stream_processor_cv():
@@ -790,6 +804,20 @@ def _stream_processor_dvpp():
 
     while True:
         try:
+            # 外部强制重连请求（/start 在帧获取失败时触发）
+            if _force_reconnect_event.is_set():
+                _force_reconnect_event.clear()
+                print("[DVPP] 收到强制重连请求，重建解码器...")
+                if decoder is not None:
+                    _cleanup_dvpp(decoder)
+                    decoder = None
+                    _state.dvpp_decoder = None
+                reconnect_count = 0  # 重置计数，避免触发 CPU 降级
+                local_is_recording = False
+                local_writer = None
+                write_frame_counter = 0
+                _state.frames_written = 0
+
             if decoder is None or not decoder.is_started:
                 if reconnect_count >= max_reconnect:
                     print(f"[DVPP] 连续 {max_reconnect} 次连接失败，降级到 CPU 软解码")
@@ -834,9 +862,23 @@ def _stream_processor_dvpp():
                 continue
             last_frame_time = time.time()
 
+            # 待考状态（IDLE）：不读帧、不解码、不推理、不录屏，降低 CPU/NPU 占用
+            # demux 线程仍在后台拉流保活，RTSP 不会断；/start 时 exam_state=STARTING 立即唤醒
+            if _state.exam_state == ExamState.IDLE:
+                time.sleep(0.5)
+                continue
+
             if use_aipp:
                 # AIPP 零拷贝路径：同时获取 NV12 device buffer（推理）和 BGR 帧（显示/录制）
                 nv12_info, bgr_frame = decoder.read_frame_aipp()
+                if nv12_info is None:
+                    # 先尝试软复位，快速恢复
+                    if hasattr(decoder, 'soft_reset'):
+                        try:
+                            decoder.soft_reset()
+                            nv12_info, bgr_frame = decoder.read_frame_aipp()
+                        except Exception:
+                            nv12_info = None
                 if nv12_info is None:
                     print("[WARN] DVPP AIPP 读取帧失败，重新连接...")
                     _cleanup_dvpp(decoder)
@@ -852,7 +894,7 @@ def _stream_processor_dvpp():
                     continue
 
                 # AIPP 模式：提交 device buffer 给推理管线（零拷贝）
-                if _state.inference_backend and _state.is_recording and _state.enable_detection and _state.user_id:
+                if _state.inference_backend and _state.exam_state == ExamState.RUNNING and _state.user_id:
                     if _inference_pipeline is not None:
                         try:
                             while _inference_pipeline.frame_queue.full():
@@ -936,7 +978,7 @@ def _dispatch_frame(frame, write_frame_counter, local_is_recording, local_writer
     except:
         pass
 
-    if _state.inference_backend and _state.is_recording and _state.enable_detection and _state.user_id:
+    if _state.inference_backend and _state.exam_state == ExamState.RUNNING and _state.user_id:
         if _inference_pipeline is not None:
             _inference_pipeline.submit_frame(frame)
 
@@ -956,23 +998,23 @@ def _handle_recording(frame, local_is_recording, local_writer, write_frame_count
     # DVPP 模式：demux 线程直接 remux，不需要帧写入
     if _state.dvpp_decoder is not None and hasattr(_state.dvpp_decoder, 'is_recording'):
         # 仅跟踪录制状态变化
-        if not local_is_recording and _state.is_recording:
+        if not local_is_recording and _state.exam_state == ExamState.RUNNING:
             local_is_recording = True
             print(f"[REC] DVPP PyAV remux 录制已激活")
-        if local_is_recording and not _state.is_recording:
+        if local_is_recording and _state.exam_state != ExamState.RUNNING:
             print(f"[REC] DVPP 录制停止")
             local_is_recording = False
         return local_is_recording, local_writer, write_frame_counter
 
     # CPU 模式：帧写入逻辑
     if not local_is_recording or local_writer is None:
-        if _state.is_recording and _state.video_writer is not None and _state.video_writer.isOpened():
+        if _state.exam_state == ExamState.RUNNING and _state.video_writer is not None and _state.video_writer.isOpened():
             local_is_recording = True
             local_writer = _state.video_writer
             write_frame_counter = 0
             _state.frames_written = 0
             print(f"[REC] 录制已激活，writer类型={type(local_writer).__name__}")
-        elif _state.is_recording and write_frame_counter == 0:
+        elif _state.exam_state == ExamState.RUNNING and write_frame_counter == 0:
             print(f"[REC-DIAG] 录制未激活: video_writer is None or not opened")
     if local_is_recording and local_writer is not None and local_writer.isOpened():
         try:
@@ -983,7 +1025,7 @@ def _handle_recording(frame, local_is_recording, local_writer, write_frame_count
                 print(f"[REC] 录制中：已写入{write_frame_counter}帧")
         except Exception as e:
             print(f"[WARN]  帧写入失败: {e}")
-    if not _state.is_recording and local_is_recording:
+    if _state.exam_state != ExamState.RUNNING and local_is_recording:
         print(f"[REC] 录制停止，最后实际写入帧计数: {write_frame_counter}")
         local_is_recording = False
         local_writer = None
@@ -1006,7 +1048,7 @@ def stream_processor():
 def analyze_and_check(frame):
     """后台异步执行：帧推理+步骤检查+坐标回调"""
     try:
-        if not _state.is_recording or not _state.enable_detection:
+        if _state.exam_state != ExamState.RUNNING:
             return
         detections, vis_frame, det_texts = analyze_frame_with_tracking(frame)
         _state.latest_det_texts = det_texts
@@ -1173,7 +1215,7 @@ def generate_stream():
                     cv2.putText(vis_frame, f"ID:{track_id}", (x1, y1-5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
 
-            status_text = f"当前步骤:{_state.current_step} | 录制:{_state.is_recording} | 已写帧数:{_state.frames_written}"
+            status_text = f"当前步骤:{_state.current_step} | exam_state:{_state.exam_state} | 已写帧数:{_state.frames_written}"
             all_texts.append((10, 30, status_text, (0, 255, 0)))
 
             render_chinese_texts(vis_frame, all_texts, _PIL_FONT)

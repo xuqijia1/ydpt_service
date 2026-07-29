@@ -488,6 +488,18 @@ class AscendInferenceEngine(BaseInferenceEngine):
 
         acl.rt.set_device(self.device_id)
 
+        # 输入大小校验
+        if hasattr(self, '_expected_input_size') and self._expected_input_size > 0:
+            if dev_size != self._expected_input_size:
+                if self._expected_input_size == dev_size * 8:
+                    print(f"[AIPP] 模型输入 size={self._expected_input_size} 是 float32 NCHW 格式，"
+                          f"不是 NV12 AIPP 模型！请检查: 1) model_path 是否指向 _aipp.om; "
+                          f"2) ATC 转换时是否加了 --insert_op_conf=aipp.cfg")
+                else:
+                    print(f"[AIPP] 输入大小不匹配: dev_size={dev_size}, 期望={self._expected_input_size} "
+                          f"(模型输入: {self._model_input_h}x{self._model_input_w})")
+                return None
+
         # 创建输入 dataset（每帧新建，绑定当前帧的 device buffer）
         input_dataset = acl.mdl.create_dataset()
         input_buf = acl.create_data_buffer(dev_ptr, dev_size)

@@ -490,7 +490,7 @@ class PyAvStreamRecorder:
                 f.write(f"file '{file}'\n")
         # 纯拷贝合并，无软编码
         merge_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            _get_ffmpeg_bin(), "-y", "-f", "concat", "-safe", "0",
             "-i", list_file, "-c", "copy", target_mp4
         ]
         try:
@@ -1603,11 +1603,10 @@ class AclVdecDecoder(BaseVideoDecoder):
         if self._ctx is not None:
             acl.rt.destroy_context(self._ctx)
             self._ctx = None
-        if self._acl_inited:
-            # 只有自己初始化的 ACL 才 reset/finalize
-            acl.rt.reset_device(self.device_id)
-            acl.finalize()
-            self._acl_inited = False
+        # 注意：不调 acl.rt.reset_device / acl.finalize
+        # 这两个调用是全局性的，会清理整个 device 上所有 ACL 资源（包括其他解码器的 VDEC/VPC 通道），
+        # 导致同 device 的其他解码器重建时 vdec_create_channel 失败 (507018)。
+        # 多解码器共享同一 device 时，仅销毁自己的 context，device/finalize 由进程退出时清理。
 
         print(f"[AclVdec] 资源已释放 (解码帧数: {self._frame_count})")
 

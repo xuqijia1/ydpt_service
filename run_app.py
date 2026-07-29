@@ -7,6 +7,8 @@ import json
 import requests
 import platform
 import subprocess
+import signal
+import sys
 from datetime import datetime
 from collections import OrderedDict, deque
 from pathlib import Path
@@ -17,6 +19,7 @@ import setproctitle
 
 # 导入统一推理引擎模块
 from inference_engine import create_inference_engine, draw_detection_boxes, render_chinese_texts, CLASS_COLORS, _PIL_FONT, get_adaptive_recog_area
+from exam_state import ExamState
 
 # 导入视频帧处理模块
 import video_processor
@@ -650,8 +653,7 @@ class StepValidator:
 class GlobalState:
     """全局状态管理器，统一管理服务所有运行状态"""
     def __init__(self):
-        self.is_recording = False
-        self.enable_detection = False
+        self.exam_state = ExamState.IDLE
         self.user_id = None
         self.video_writer = None
         self.frame_queue = queue.Queue(maxsize=30)
@@ -691,9 +693,8 @@ class GlobalState:
 
     def reset(self):
         """软重置：清理用户相关状态，保留服务基础状态"""
-        self.is_recording = False
+        self.exam_state = ExamState.IDLE
         self.user_id = None
-        self.enable_detection = False
         if self.video_writer:
             try:
                 self.video_writer.release()
@@ -1003,16 +1004,35 @@ def start():
 
         print(f"[ICON] 收到开始考试请求: user_id={user_id}")
         with state.lock:
-            if state.is_recording:
+            if state.exam_state != ExamState.IDLE:
                 return jsonify({"error": "已有考试正在进行，请勿重复启动"}), 400
             # 硬重置所有状态
             state.hard_reset()
             state.frames_written = 0
 
-            # 获取有效视频帧，确认分辨率
-            frame = video_processor.get_current_frame()
+            # 提前设 exam_state=STARTING 唤醒 stream_processor（IDLE 时读帧线程在 sleep）
+            # user_id 暂未设置，stream_processor 不会触发推理（行 890 检查 user_id）
+            state.exam_state = ExamState.STARTING
+
+            # 获取有效视频帧，确认分辨率（等待重连，最多15秒）
+            frame = video_processor.get_current_frame(max_wait=15)
             if frame is None or not video_processor.is_valid_frame(frame):
-                return jsonify({"error": "无法从视频源获取有效帧"}), 500
+                # 尝试触发 DVPP 软复位（快速恢复瞬时问题）
+                if state.dvpp_decoder is not None and hasattr(state.dvpp_decoder, 'soft_reset'):
+                    try:
+                        state.dvpp_decoder.soft_reset()
+                    except Exception:
+                        pass
+                frame = video_processor.get_current_frame(max_wait=10)
+            if frame is None or not video_processor.is_valid_frame(frame):
+                # soft_reset 仍失败：强制 DVPP 完整重连（恢复长时间空闲后的死连接）
+                print("[WARN] soft_reset 未恢复，强制 DVPP 完整重连...")
+                video_processor.force_reconnect_dvpp()
+                frame = video_processor.get_current_frame(max_wait=30)
+            if frame is None or not video_processor.is_valid_frame(frame):
+                # 三级恢复全失败，恢复待考状态
+                state.exam_state = ExamState.IDLE
+                return jsonify({"error": "无法从视频源获取有效帧，请检查视频连接"}), 500
             h, w = frame.shape[:2]
             state.frame_width = w
             state.frame_height = h
@@ -1060,10 +1080,9 @@ def start():
             else:
                 print(f"[INFO] 视频录制已禁用 (enable_recording=false)")
 
-            # 更新全局状态，开始录制
-            state.is_recording = True
+            # 更新全局状态，进入 RUNNING（启动推理 + 录制写入）
+            state.exam_state = ExamState.RUNNING
             state.user_id = user_id
-            state.enable_detection = True
             state.video_path = video_path
 
             # 打印开始考试信息
@@ -1104,11 +1123,10 @@ def stop():
         user_id = data.get('userid')
 
         with state.lock:
-            if not state.is_recording or state.user_id != user_id:
+            if state.exam_state == ExamState.IDLE or state.user_id != user_id:
                 return jsonify({"error": "无正在进行的考试，或考生ID不匹配"}), 400
             # 停止录制和检测
-            state.is_recording = False
-            state.enable_detection = False
+            state.exam_state = ExamState.IDLE
             # 缓存需要关闭的写入器和视频信息
             writer_to_close = state.video_writer
             decoder_to_stop = state.dvpp_decoder if (state.dvpp_decoder is not None and
@@ -1231,7 +1249,7 @@ def ydpt_sseboxes():
                         "frame_id": state.frame_id,
                         "timestamp": int(time.time()),
                         "boxes": state.latest_detections,
-                        "is_recording": state.is_recording,
+                        "is_recording": state.exam_state == ExamState.RUNNING,
                         "recog_area": adaptive_recog_area,
                         "resolution": {"width": state.frame_width, "height": state.frame_height}
                     }
@@ -1271,7 +1289,7 @@ def get_boxes():
             "frame_id": state.frame_id,
             "timestamp": int(time.time()),
             "boxes": detections,
-            "is_recording": state.is_recording,
+            "is_recording": state.exam_state == ExamState.RUNNING,
             "recog_area": adaptive_recog_area,
             "resolution": {"width": orig_w, "height": orig_h}
         })
@@ -1301,7 +1319,7 @@ def health():
         "model_loaded": state.inference_backend is not None,
         "backend": Config.INFERENCE_BACKEND,
         "device": Config.DEVICE_ID,
-        "is_recording": state.is_recording,
+        "is_recording": state.exam_state == ExamState.RUNNING,
         "current_step": state.current_step,
         "streaming_enabled": Config.ENABLE_STREAMING,
         "frames_written": state.frames_written,
@@ -1572,7 +1590,38 @@ def initialize_service():
         return False
 
 # ==================== 新增main函数 ====================
+def _cleanup_on_exit():
+    """服务退出时清理 DVPP 解码器、录制器等资源"""
+    try:
+        import video_processor
+        # 清理 DVPP 解码器
+        if hasattr(video_processor, '_state') and video_processor._state.dvpp_decoder is not None:
+            try:
+                video_processor._cleanup_dvpp(video_processor._state.dvpp_decoder)
+                video_processor._state.dvpp_decoder = None
+            except Exception as e:
+                print(f"[CLEANUP] DVPP 清理异常: {e}")
+        # 释放录制器
+        if hasattr(video_processor, '_state') and video_processor._state.video_writer is not None:
+            try:
+                video_processor._state.video_writer.release()
+                video_processor._state.video_writer = None
+            except Exception as e:
+                print(f"[CLEANUP] 录制器释放异常: {e}")
+    except Exception as e:
+        print(f"[CLEANUP] 清理异常: {e}")
+
+
+def _sigterm_handler(signum, frame):
+    print(f"[SIGNAL] 接收到信号 {signum}，触发优雅退出...")
+    _cleanup_on_exit()
+    sys.exit(0)
+
+
 def main():
+    # 注册信号处理：容器停止时优雅清理
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     # 初始化服务，失败则退出
     if not initialize_service():
         print("[STOP] 服务初始化失败，程序退出！")
