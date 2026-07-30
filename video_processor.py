@@ -785,7 +785,7 @@ def _stream_processor_cv():
 
 
 def _stream_processor_dvpp():
-    """视频流处理 - DVPP 硬解码路径（自动降级到 CPU 软解码）
+    """视频流处理 - DVPP 硬解码路径（Ascend 环境，失败持续重试，不降级 cv2）
 
     AIPP 模式下使用 read_frame_device_nv12() 零拷贝推理，
     非 AIPP 模式使用 read_frame() BGR 帧推理。
@@ -799,7 +799,8 @@ def _stream_processor_dvpp():
     local_is_recording = False
     local_writer = None
     reconnect_count = 0
-    max_reconnect = getattr(_config, 'DVPP_MAX_RECONNECT', 3)
+    # Ascend 环境不允许回退 cv2，max_reconnect 提升至 10，递增等待 2/5/8/15/30/30/.../30s
+    max_reconnect = getattr(_config, 'DVPP_MAX_RECONNECT', 10)
     use_aipp = getattr(_config, 'ASCEND_AIPP', False)
 
     while True:
@@ -820,18 +821,29 @@ def _stream_processor_dvpp():
 
             if decoder is None or not decoder.is_started:
                 if reconnect_count >= max_reconnect:
-                    print(f"[DVPP] 连续 {max_reconnect} 次连接失败，降级到 CPU 软解码")
-                    _stream_processor_cv()
-                    return
+                    # Ascend 环境不回退 cv2，长睡后重置计数继续重试硬解码
+                    print(f"[DVPP] 连续 {max_reconnect} 次连接失败，等待 60s 后继续重试硬解码（不降级 cv2）")
+                    time.sleep(60)
+                    reconnect_count = 0
+                    continue
 
                 print(f"[DVPP] 连接视频源: {_config.RTSP_URL} (尝试 {reconnect_count + 1}/{max_reconnect})")
-                decoder = create_dvpp_decoder(
-                    rtsp_url=_config.RTSP_URL,
-                    device_id=_config.DVPP_DEVICE_ID,
-                    channel_id=getattr(_config, 'DVPP_CHANNEL_ID', None),
-                    en_type=_config.DVPP_EN_TYPE,
-                    auto_detect_codec=getattr(_config, 'DVPP_AUTO_DETECT_CODEC', True),
-                )
+                try:
+                    decoder = create_dvpp_decoder(
+                        rtsp_url=_config.RTSP_URL,
+                        device_id=_config.DVPP_DEVICE_ID,
+                        channel_id=getattr(_config, 'DVPP_CHANNEL_ID', None),
+                        en_type=_config.DVPP_EN_TYPE,
+                        auto_detect_codec=getattr(_config, 'DVPP_AUTO_DETECT_CODEC', True),
+                    )
+                except RuntimeError as e:
+                    print(f"[ERR] DVPP 硬解码创建失败: {e}")
+                    decoder = None
+                    reconnect_count += 1
+                    wait_time = min(5 * reconnect_count, 30)
+                    print(f"[DVPP] {wait_time}秒后重试...")
+                    time.sleep(wait_time)
+                    continue
                 if decoder is None:
                     reconnect_count += 1
                     wait_time = min(5 * reconnect_count, 30)
@@ -839,8 +851,10 @@ def _stream_processor_dvpp():
                     time.sleep(wait_time)
                     continue
                 reconnect_count = 0
-                _state.frame_width = decoder.width
-                _state.frame_height = decoder.height
+                # 优先 src_width/src_height（DVPP 源分辨率 1920×1080），回退 width/height（cv2 模式）
+                # 检测框经 orig_size 反推后已回到源分辨率空间，frame_width/height 必须与之一致
+                _state.frame_width = getattr(decoder, 'src_width', None) or decoder.width
+                _state.frame_height = getattr(decoder, 'src_height', None) or decoder.height
                 _state.dvpp_decoder = decoder
                 if hasattr(decoder, 'src_height'):
                     _state.orig_size = (decoder.src_height, decoder.src_width)
@@ -954,9 +968,11 @@ def _stream_processor_dvpp():
             write_frame_counter = 0
             _state.frames_written = 0
             if reconnect_count >= max_reconnect:
-                print(f"[DVPP] 连续 {max_reconnect} 次异常，降级到 CPU 软解码")
-                _stream_processor_cv()
-                return
+                # Ascend 环境不回退 cv2，长睡后重置计数继续重试硬解码
+                print(f"[DVPP] 连续 {max_reconnect} 次异常，等待 60s 后继续重试硬解码（不降级 cv2）")
+                time.sleep(60)
+                reconnect_count = 0
+                continue
             time.sleep(5)
 
 
@@ -1034,11 +1050,15 @@ def _handle_recording(frame, local_is_recording, local_writer, write_frame_count
 
 
 def stream_processor():
-    """视频流核心处理线程 - 根据配置选择 CPU软解码 或 DVPP硬解码（自动降级）"""
+    """视频流核心处理线程 - 根据配置选择 CPU软解码 或 DVPP硬解码
+
+    Ascend + DVPP_DECODE_ENABLED：必须使用硬解码，失败持续重试，**不降级 cv2**
+    其他环境：使用 cv2 软解码作为兼容方案
+    """
     use_dvpp = (_config.DVPP_DECODE_ENABLED and
                 _config.INFERENCE_BACKEND.lower() in ("ascend",))
     if use_dvpp:
-        print("[OK] 视频流模式: DVPP 硬解码 (Ascend-FFmpeg, CPU 兜底)")
+        print("[OK] 视频流模式: DVPP 硬解码 (Ascend，不降级 cv2)")
         _stream_processor_dvpp()
     else:
         print("[OK] 视频流模式: CPU 软解码 (cv2.VideoCapture)")

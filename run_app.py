@@ -194,30 +194,6 @@ def check_overlap(det1, det2, iou_threshold=Config.IOU_THRESHOLD):
     """检查两个检测目标是否重叠"""
     return calculate_iou(det1['box'], det2['box']) > iou_threshold
 
-def is_in_zone(box, zone):
-    """检查检测框是否在指定区域内（带坐标比例映射）"""
-    try:
-        cx = (box[0] + box[2]) / 2
-        cy = (box[1] + box[3]) / 2
-
-        coords = zone['coords']
-        CONFIG_W, CONFIG_H = Config.CONFIG_WIDTH, Config.CONFIG_HEIGHT
-        frame_w = state.frame_width or CONFIG_W
-        frame_h = state.frame_height or CONFIG_H
-
-        scale_x = frame_w / CONFIG_W if CONFIG_W > 0 else 1.0
-        scale_y = frame_h / CONFIG_H if CONFIG_H > 0 else 1.0
-
-        zone_x1 = coords[0] * scale_x
-        zone_y1 = coords[1] * scale_y
-        zone_x2 = coords[2] * scale_x
-        zone_y2 = coords[3] * scale_y
-
-        return zone_x1 <= cx <= zone_x2 and zone_y1 <= cy <= zone_y2
-    except Exception as e:
-        print(f"区域检查错误: {e}, box={box}, zone={zone}")
-        return False
-
 
 # ==================== 对象跟踪模块 ====================
 class ObjectTracker:
@@ -1033,9 +1009,17 @@ def start():
                 # 三级恢复全失败，恢复待考状态
                 state.exam_state = ExamState.IDLE
                 return jsonify({"error": "无法从视频源获取有效帧，请检查视频连接"}), 500
-            h, w = frame.shape[:2]
-            state.frame_width = w
-            state.frame_height = h
+            # DVPP 模式 frame 是 VPC resize 后的 640×640，不能用来覆盖 frame_width/height
+            # video_processor._stream_processor_dvpp 已用 src_width/src_height 设置为源分辨率（1920×1080）
+            # 仅 cv2 模式（dvpp_decoder is None）才用 frame.shape 更新
+            if state.dvpp_decoder is None:
+                h, w = frame.shape[:2]
+                state.frame_width = w
+                state.frame_height = h
+            else:
+                # DVPP 模式：用 video_processor 已设置的源分辨率供后续日志打印
+                w = state.frame_width
+                h = state.frame_height
 
             # 视频录制（根据配置开关决定是否启用）
             video_path = None
@@ -1274,7 +1258,10 @@ def get_boxes():
         # 执行推理和跟踪，返回最新检测结果
         detections, _, _ = video_processor.analyze_frame_with_tracking(frame)
         # 获取当前帧分辨率，计算自适应检测区域
-        orig_h, orig_w = frame.shape[:2]
+        # DVPP 模式 frame 是 VPC resize 后的 640×640，但 recog_area 配置在 1920×1080 空间
+        # 应使用 state.frame_width/height（源分辨率），否则 recog_area 会被错误缩放到 1/3
+        orig_w = state.frame_width or frame.shape[1]
+        orig_h = state.frame_height or frame.shape[0]
         current_resolution = (orig_w, orig_h)
         # 获取自适应检测区域
         if Config.RECOG_AREA:
