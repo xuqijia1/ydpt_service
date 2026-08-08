@@ -625,6 +625,41 @@ class StepValidator:
             return True  # 历史帧不足时临时允许通过
         return True  # 始终返回True，让外层处理多帧确认
 
+class _LockTimeout(Exception):
+    """带超时锁获取失败时抛出，供 /start 捕获后快速返回 503。"""
+    pass
+
+
+class _TimedLock:
+    """带超时的锁上下文管理器：__enter__ 获取不到锁时抛 _LockTimeout。
+
+    替代 /start 全程持有 state.lock（无超时，三级恢复卡死时永久阻塞），
+    确保并发 /start 不会因拿不到锁而无限阻塞，保证服务持续可响应。
+    """
+
+    def __init__(self, lock, timeout, name="lock"):
+        self._lock = lock
+        self._timeout = timeout
+        self._name = name
+        self._acquired = False
+
+    def __enter__(self):
+        self._acquired = self._lock.acquire(timeout=self._timeout)
+        if not self._acquired:
+            raise _LockTimeout(
+                f"系统繁忙，上一次考试启动未结束（等待 {self._timeout:.0f}s 未获得 {self._name}），请稍后重试")
+        return self
+
+    def __exit__(self, *exc):
+        if self._acquired:
+            self._lock.release()
+        return False
+
+
+START_LOCK = threading.Lock()
+START_LOCK_TIMEOUT = 10.0
+
+
 # ==================== 全局状态管理 ====================
 class GlobalState:
     """全局状态管理器，统一管理服务所有运行状态"""
@@ -644,7 +679,8 @@ class GlobalState:
         self.frame_width = 0
         self.frame_height = 0
         self.orig_size = None  # DVPP 路径原始分辨率 (src_h, src_w)，用于坐标缩放
-        self.dvpp_decoder = None  # DVPP 解码器引用，用于 PyAV remux 录制
+        self.dvpp_decoder = None  # DVPP 解码器引用（reader/soft_reset/退出清理用；不再做服务端录制）
+        self.is_healthy = False       # AIPP 流健康标志（IDLE 时 reader 探测维护，/start 非阻塞检查）
         self.frame_id = 0
         self.latest_detections = []
         self.zones_cache = None
@@ -671,12 +707,7 @@ class GlobalState:
         """软重置：清理用户相关状态，保留服务基础状态"""
         self.exam_state = ExamState.IDLE
         self.user_id = None
-        if self.video_writer:
-            try:
-                self.video_writer.release()
-            except:
-                pass
-            self.video_writer = None
+        self.is_healthy = False
 
         self.video_path = None
         self.frames_written = 0
@@ -979,112 +1010,68 @@ def start():
             return jsonify({"error": "缺少必传参数：userid"}), 400
 
         print(f"[ICON] 收到开始考试请求: user_id={user_id}")
-        with state.lock:
-            if state.exam_state != ExamState.IDLE:
-                return jsonify({"error": "已有考试正在进行，请勿重复启动"}), 400
-            # 硬重置所有状态
-            state.hard_reset()
-            state.frames_written = 0
 
-            # 提前设 exam_state=STARTING 唤醒 stream_processor（IDLE 时读帧线程在 sleep）
-            # user_id 暂未设置，stream_processor 不会触发推理（行 890 检查 user_id）
-            state.exam_state = ExamState.STARTING
+        try:
+            with _TimedLock(START_LOCK, START_LOCK_TIMEOUT, "START_LOCK"):
+                # 短持 state.lock 做状态转换（不再全程持有，避免阻塞 /stop 与并发 /start）
+                with state.lock:
+                    if state.exam_state != ExamState.IDLE:
+                        return jsonify({"error": "已有考试正在进行，请勿重复启动"}), 400
+                    state.hard_reset()
+                    state.frames_written = 0
+                    # 提前设 STARTING 唤醒 reader（IDLE 时 DVPP reader 在做健康探测）
+                    state.exam_state = ExamState.STARTING
 
-            # 获取有效视频帧，确认分辨率（等待重连，最多15秒）
-            frame = video_processor.get_current_frame(max_wait=15)
-            if frame is None or not video_processor.is_valid_frame(frame):
-                # 尝试触发 DVPP 软复位（快速恢复瞬时问题）
-                if state.dvpp_decoder is not None and hasattr(state.dvpp_decoder, 'soft_reset'):
-                    try:
-                        state.dvpp_decoder.soft_reset()
-                    except Exception:
-                        pass
-                frame = video_processor.get_current_frame(max_wait=10)
-            if frame is None or not video_processor.is_valid_frame(frame):
-                # soft_reset 仍失败：强制 DVPP 完整重连（恢复长时间空闲后的死连接）
-                print("[WARN] soft_reset 未恢复，强制 DVPP 完整重连...")
-                video_processor.force_reconnect_dvpp()
-                frame = video_processor.get_current_frame(max_wait=30)
-            if frame is None or not video_processor.is_valid_frame(frame):
-                # 三级恢复全失败，恢复待考状态
-                state.exam_state = ExamState.IDLE
-                return jsonify({"error": "无法从视频源获取有效帧，请检查视频连接"}), 500
-            # DVPP 模式 frame 是 VPC resize 后的 640×640，不能用来覆盖 frame_width/height
-            # video_processor._stream_processor_dvpp 已用 src_width/src_height 设置为源分辨率（1920×1080）
-            # 仅 cv2 模式（dvpp_decoder is None）才用 frame.shape 更新
-            if state.dvpp_decoder is None:
-                h, w = frame.shape[:2]
-                state.frame_width = w
-                state.frame_height = h
-            else:
-                # DVPP 模式：用 video_processor 已设置的源分辨率供后续日志打印
-                w = state.frame_width
-                h = state.frame_height
+                use_aipp = getattr(Config, 'ASCEND_AIPP', False)
+                use_dvpp = (Config.DVPP_DECODE_ENABLED and
+                            Config.INFERENCE_BACKEND.lower() in ("ascend",))
 
-            # 视频录制（根据配置开关决定是否启用）
-            video_path = None
-            WRITE_FPS = Config.VIDEO_WRITE_FPS
-            use_dvpp_recorder = (state.dvpp_decoder is not None and
-                                 hasattr(state.dvpp_decoder, 'start_record'))
-            if Config.ENABLE_RECORDING:
-                video_path = video_processor.get_video_save_path(user_id)
-                if use_dvpp_recorder:
-                    # DVPP 模式：PyAV remux 录制（零 CPU 编码，保留原始分辨率）
-                    try:
-                        state.dvpp_decoder.start_record(video_path)
-                        print(f"[OK] PyAV remux 录制启动: {video_path}")
-                    except Exception as e:
-                        print(f"[ERR] PyAV remux 录制启动失败: {e}")
-                        use_dvpp_recorder = False
-                if not use_dvpp_recorder:
-                    # CPU 模式或 DVPP 录制失败回退：FFmpegVideoWriter / OpenCV
-                    try:
-                        writer = video_processor.FFmpegVideoWriter(video_path, WRITE_FPS, w, h, codec='libx264')
-                        print(f"[OK] FFmpeg编码器初始化成功，帧率: {WRITE_FPS:.1f}fps")
-                    except Exception as e:
-                        print(f"[ERR] FFmpeg初始化失败: {e}，回退到OpenCV")
-                        writer = None
-                        codecs_to_try = [('mp4v', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')]
-                        for codec, ext in codecs_to_try:
-                            try:
-                                fourcc = cv2.VideoWriter_fourcc(*codec)
-                                video_path_ext = video_path.replace('.mp4', ext)
-                                writer = cv2.VideoWriter(video_path_ext, fourcc, WRITE_FPS, (w, h))
-                                if writer.isOpened():
-                                    print(f"[OK] OpenCV编码器 {codec} 初始化成功")
-                                    video_path = video_path_ext
-                                    break
-                            except Exception as e2:
-                                print(f"[WARN]  编码器 {codec} 初始化失败: {e2}")
-                                writer = None
-                                continue
-                    if writer is None or not writer.isOpened():
-                        return jsonify({"error": "所有编码器均无法使用，无法创建视频写入器"}), 500
-                    state.video_writer = writer
-            else:
-                print(f"[INFO] 视频录制已禁用 (enable_recording=false)")
+                # 视频源就绪检查（毫秒~秒级，非阻塞；不再做三级恢复）
+                ready_frame = None
+                if use_dvpp and use_aipp:
+                    # AIPP：reader IDLE 探测已维护 is_healthy，直接读快照
+                    if not state.is_healthy:
+                        with state.lock:
+                            state.exam_state = ExamState.IDLE
+                        return jsonify({"error": "视频源未就绪，请稍后重试"}), 500
+                else:
+                    # 非 AIPP（DVPP BGR / CPU）：短超时验证帧可用
+                    ready_frame = video_processor.get_current_frame(max_wait=3)
+                    if ready_frame is None or not video_processor.is_valid_frame(ready_frame):
+                        with state.lock:
+                            state.exam_state = ExamState.IDLE
+                        return jsonify({"error": "无法从视频源获取有效帧，请检查视频连接"}), 500
 
-            # 更新全局状态，进入 RUNNING（启动推理 + 录制写入）
-            state.exam_state = ExamState.RUNNING
-            state.user_id = user_id
-            state.video_path = video_path
+                # 分辨率：DVPP 由 reader 用 src_width/src_height 设为源分辨率；CPU 取就绪帧 shape
+                if state.dvpp_decoder is not None:
+                    w, h = state.frame_width, state.frame_height
+                else:
+                    h, w = ready_frame.shape[:2]
+                    state.frame_width, state.frame_height = w, h
 
-            # 打印开始考试信息
-            rec_mode = "PyAV remux" if use_dvpp_recorder else Config.VIDEO_CODEC
-            print(f"="*50)
-            print(f"[OK] 考试已启动: user_id={user_id}")
-            print(f"[VIDEO] 视频路径: {video_path} | 分辨率: {w}x{h}")
-            print(f"[REC] 录制模式: {rec_mode} | 帧率: {WRITE_FPS:.1f}fps")
-            print(f"="*50)
+                WRITE_FPS = Config.VIDEO_WRITE_FPS
 
-        # 返回成功响应
-        return jsonify({
-            "status": "started",
-            "userid": user_id,
-            "video_path": video_path,
-            "fps": WRITE_FPS,
-            "resolution": f"{w}x{h}"
-        })
+                # 进入 RUNNING（启动推理；服务端录制已移除，转摄像头刻录机）
+                with state.lock:
+                    state.exam_state = ExamState.RUNNING
+                    state.user_id = user_id
+                    state.video_path = None
+
+                print("=" * 50)
+                print(f"[OK] 考试已启动: user_id={user_id}")
+                print(f"[VIDEO] 分辨率: {w}x{h} | 帧率: {WRITE_FPS:.1f}fps")
+                print("=" * 50)
+
+                return jsonify({
+                    "status": "started",
+                    "userid": user_id,
+                    "video_path": None,
+                    "fps": WRITE_FPS,
+                    "resolution": f"{w}x{h}"
+                })
+        except _LockTimeout as e:
+            return jsonify({"error": str(e)}), 503
+
     except Exception as e:
         print(f"[ERR] 开始考试接口异常: {e}")
         import traceback
@@ -1101,103 +1088,31 @@ def stop():
     返回结果：{"status": "stopped", "userid": "", "video_path": "", "frames_written": 0, "file_valid": true}
     """
     try:
-        import subprocess
-        import shutil  # 新增：判断ffprobe是否存在
         data = request.json or {}
         user_id = data.get('userid')
 
         with state.lock:
             if state.exam_state == ExamState.IDLE or state.user_id != user_id:
                 return jsonify({"error": "无正在进行的考试，或考生ID不匹配"}), 400
-            # 停止录制和检测
+            # 停止检测，回到待考（reader 回到 IDLE 健康探测；服务端录制已移除）
             state.exam_state = ExamState.IDLE
-            # 缓存需要关闭的写入器和视频信息
-            writer_to_close = state.video_writer
-            decoder_to_stop = state.dvpp_decoder if (state.dvpp_decoder is not None and
-                                                       hasattr(state.dvpp_decoder, 'is_recording') and
-                                                       state.dvpp_decoder.is_recording) else None
             video_path = state.video_path
             written_frames = state.frames_written
-
-        # DVPP 模式：停止 PyAV remux 录制
-        if decoder_to_stop is not None:
-            try:
-                rec_mp4 = decoder_to_stop.stop_record()
-                if rec_mp4:
-                    video_path = rec_mp4
-                print(f"[OK] PyAV remux 录制停止: {rec_mp4}")
-            except Exception as e:
-                print(f"[ERR] PyAV remux 录制停止异常: {e}")
-
-        # CPU 模式：等待编码器缓存刷盘并释放写入器
-        if writer_to_close and hasattr(writer_to_close, 'isOpened') and writer_to_close.isOpened():
-            print(f"[ICON] 等待FFmpeg编码器缓存刷盘（超时{Config.FFMPEG_FLUSH_TIMEOUT}秒）...")
-            try:
-                time.sleep(Config.FFMPEG_FLUSH_TIMEOUT)
-                print(f"[OK] FFmpeg编码器缓存刷盘完成，无额外帧写入")
-            except Exception as e:
-                print(f"[WARN]  缓存刷盘警告: {e}（不影响视频完整性）")
-
-        if writer_to_close:
-            try:
-                if hasattr(writer_to_close, 'isOpened') and writer_to_close.isOpened():
-                    writer_to_close.release()
-                state.video_writer = None
-                print(f"[VIDEO] 视频写入器已安全关闭（无FFmpeg断言/PTS错误）")
-            except Exception as e:
-                print(f"[WARN]  关闭视频写入器警告: {e}（已做容错处理）")
-
-        # 验证视频文件有效性
-        file_valid = False
-        file_size = 0
-        if video_path and os.path.exists(video_path):
-            file_size = os.path.getsize(video_path)
-            print(f"[VIDEO] 考试视频: {video_path} | 大小: {file_size:,} 字节")
-            # PyAV remux 模式无 frames_written 计数，用文件大小判断
-            if file_size > 100 * 1024:  # >100KB 即视为有效
-                file_valid = True
-                ffprobe_path = shutil.which("ffprobe")
-                if ffprobe_path:
-                    try:
-                        result = subprocess.run([
-                            ffprobe_path, '-v', 'quiet', '-print_format', 'json',
-                            '-show_streams', '-show_format', video_path
-                        ], capture_output=True, text=True, timeout=5)
-                        if result.returncode == 0:
-                            probe_data = json.loads(result.stdout)
-                            duration = float(probe_data.get('format', {}).get('duration', 0))
-                            streams = probe_data.get('streams', [])
-                            if streams:
-                                actual_fps = eval(streams[0]['r_frame_rate'])
-                                print(f"[OK] 视频验证成功: 时长 {duration:.2f}秒 | 实际帧率 {actual_fps:.1f}fps")
-                            else:
-                                print(f"[OK] 视频验证成功: 时长 {duration:.2f}秒")
-                    except Exception as e:
-                        print(f"[WARN]  ffprobe验证警告: {e}（视频文件可正常播放）")
-                else:
-                    print(f"[INFO]  未检测到ffprobe，跳过视频时序验证（视频可正常播放）")
-            else:
-                print(f"[WARN]  视频文件无效：大小过小")
-
-        # 保存步骤结果并软重置状态
-        with state.lock:
             step_results = state.step_results.copy()
             state.reset()
 
-        # 打印结束考试信息
-        print(f"="*50)
+        print("=" * 50)
         print(f"[STOP] 考试已结束: user_id={user_id}")
-        print(f"[INFO] 文件有效: {file_valid} | 文件大小: {file_size:,} 字节")
-        print(f"="*50)
+        print("=" * 50)
 
-        # 返回结束考试结果
+        # 返回结束考试结果（视频由摄像头刻录机保存，服务端无视频文件）
         return jsonify({
             "status": "stopped",
             "userid": user_id,
             "video_path": video_path,
-            "video_size": file_size,
+            "video_size": 0,
             "frames_written": written_frames,
-            "file_valid": file_valid,
+            "file_valid": False,
             "step_results": step_results,
             "fps": Config.VIDEO_WRITE_FPS
         })
@@ -1310,7 +1225,7 @@ def health():
         "current_step": state.current_step,
         "streaming_enabled": Config.ENABLE_STREAMING,
         "frames_written": state.frames_written,
-        "video_writer_active": (state.video_writer is not None and state.video_writer.isOpened()) if state.video_writer else False,
+        "video_writer_active": False,
         "tracker_objects": len(tracker.objects) if 'tracker' in globals() else 0,
         "detection_buffer_size": len(state.detection_buffer),
         "fps": Config.VIDEO_WRITE_FPS
@@ -1474,7 +1389,7 @@ def initialize_service():
         print(f"操作系统: {'Linux' if Config.IS_LINUX else 'Windows'}")
         print(f"推理后端: {Config.INFERENCE_BACKEND} | 运行设备: {Config.DEVICE_ID}")
         print(f"YOLO模型: {Config.YOLOV8_MODEL_PATH} | 昇腾模型: {Config.ASCEND_OM_MODEL_PATH}")
-        print(f"视频源: {Config.RTSP_URL} | 录制帧率: {Config.VIDEO_WRITE_FPS:.1f}fps")
+        print(f"视频源: {Config.RTSP_URL} | 处理帧率: {Config.VIDEO_WRITE_FPS:.1f}fps")
         print(f"配置页面: {Config.CONFIG_WIDTH}x{Config.CONFIG_HEIGHT} | 背景图: {Config.CONFIG_BACKGROUND_IMAGE}")
 
         # 4. 初始化推理后端
@@ -1501,7 +1416,6 @@ def initialize_service():
 
         # 6. 创建必要的目录（核心调整：统一管理config目录）
         # 6.1 基础存储目录
-        os.makedirs(Config.VIDEO_SAVE_DIR, exist_ok=True)
         os.makedirs(Config.IMAGE_BASE_DIR, exist_ok=True)
         os.makedirs(Config.IMAGE_SAVE_DIR, exist_ok=True)
         
@@ -1520,32 +1434,6 @@ def initialize_service():
         if not os.path.exists(Config.CONFIG_BACKGROUND_IMAGE):
             print(f"[WARN]  配置页面背景图不存在: {Config.CONFIG_BACKGROUND_IMAGE}")
             print(f"   建议：将背景图放到 {os.path.dirname(Config.CONFIG_BACKGROUND_IMAGE)} 目录下，命名为 {os.path.basename(Config.CONFIG_BACKGROUND_IMAGE)}")
-
-        # 7. 测试编码器可用性
-        print(f"\n[ICON] 测试视频编码器...")
-        test_codecs = [(Config.VIDEO_CODEC, '.mp4'), ('mp4v', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')]
-        codec_working = False
-        for codec, ext in test_codecs:
-            try:
-                test_path = os.path.join(Config.VIDEO_SAVE_DIR, f"test_codec_{codec}{ext}")
-                test_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                fourcc = cv2.VideoWriter_fourcc(*codec)
-                test_writer = cv2.VideoWriter(test_path, fourcc, Config.VIDEO_WRITE_FPS, (640, 480))
-                if test_writer.isOpened():
-                    for _ in range(10):
-                        test_writer.write(test_frame)
-                    test_writer.release()
-                    if os.path.exists(test_path) and os.path.getsize(test_path) > 0:
-                        print(f"[OK] 编码器 {codec} 测试成功")
-                        os.remove(test_path)
-                        Config.VIDEO_CODEC = codec
-                        codec_working = True
-                        break
-            except Exception as e:
-                print(f"[WARN]  编码器 {codec} 测试失败: {e}")
-                continue
-        if not codec_working:
-            print(f"[ERR] 警告：所有编码器测试失败，视频录制功能可能不可用")
 
         # 8. 启动推理Pipeline（按后端自动选择多进程/多线程）
         pipeline = video_processor.InferencePipeline()
@@ -1578,7 +1466,7 @@ def initialize_service():
 
 # ==================== 新增main函数 ====================
 def _cleanup_on_exit():
-    """服务退出时清理 DVPP 解码器、录制器等资源"""
+    """服务退出时清理 DVPP 解码器等资源"""
     try:
         import video_processor
         # 清理 DVPP 解码器
@@ -1588,13 +1476,6 @@ def _cleanup_on_exit():
                 video_processor._state.dvpp_decoder = None
             except Exception as e:
                 print(f"[CLEANUP] DVPP 清理异常: {e}")
-        # 释放录制器
-        if hasattr(video_processor, '_state') and video_processor._state.video_writer is not None:
-            try:
-                video_processor._state.video_writer.release()
-                video_processor._state.video_writer = None
-            except Exception as e:
-                print(f"[CLEANUP] 录制器释放异常: {e}")
     except Exception as e:
         print(f"[CLEANUP] 清理异常: {e}")
 

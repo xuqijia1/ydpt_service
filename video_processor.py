@@ -10,7 +10,6 @@ import cv2
 import time
 import queue
 import threading
-import subprocess
 import numpy as np
 import multiprocessing as mp
 from datetime import datetime
@@ -96,117 +95,6 @@ def is_valid_frame(frame):
         return False
     return True
 
-
-# ==================== FFmpeg 视频写入器 ====================
-
-class FFmpegVideoWriter:
-    """FFmpeg子进程视频写入器，支持长时间录制，大文件稳定"""
-
-    def __init__(self, output_path, fps, width, height, codec='libx264'):
-        self.output_path = output_path
-        self.fps = fps
-        self.width = width
-        self.height = height
-        self.codec = codec
-        self.process = None
-        self._stderr_lines = []
-        self._start_ffmpeg()
-        # 检查进程是否立即退出
-        poll = self.process.poll()
-        if poll is not None:
-            self._drain_stderr()
-            stderr_text = ''.join(self._stderr_lines)
-            print(f"[ERR] FFmpeg 进程立即退出(码={poll}), stderr:\n{stderr_text}")
-            raise RuntimeError(f"FFmpeg 进程立即退出(码={poll})")
-
-    def _stderr_reader(self):
-        """后台线程持续读取 stderr，防止 PIPE 缓冲区满导致 FFmpeg 阻塞"""
-        try:
-            for line in self.process.stderr:
-                self._stderr_lines.append(line.decode(errors='replace'))
-                if len(self._stderr_lines) > 200:
-                    self._stderr_lines = self._stderr_lines[-100:]
-        except:
-            pass
-
-    def _drain_stderr(self):
-        """读取当前已缓存的 stderr"""
-        try:
-            while True:
-                line = self.process.stderr.readline()
-                if not line:
-                    break
-                self._stderr_lines.append(line.decode(errors='replace'))
-        except:
-            pass
-
-    def _start_ffmpeg(self):
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{self.width}x{self.height}',
-            '-pix_fmt', 'bgr24',
-            '-r', str(self.fps),
-            '-i', '-',
-            '-c:v', self.codec,
-            '-preset', 'fast',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            self.output_path
-        ]
-        try:
-            self.process = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-            )
-            # 启动后台线程读取 stderr，防止缓冲区满
-            t = threading.Thread(target=self._stderr_reader, daemon=True)
-            t.start()
-        except FileNotFoundError:
-            raise RuntimeError("ffmpeg未安装，请先安装: apt-get install ffmpeg")
-
-    def write(self, frame):
-        if self.process is None:
-            return False
-        # 写入前检查进程是否还活着
-        poll = self.process.poll()
-        if poll is not None:
-            stderr_text = ''.join(self._stderr_lines[-20:])
-            print(f"[ERR] FFmpeg 已退出(码={poll}), stderr:\n{stderr_text}")
-            return False
-        if self.process.stdin is None:
-            return False
-        try:
-            self.process.stdin.write(frame.tobytes())
-            return True
-        except BrokenPipeError:
-            stderr_text = ''.join(self._stderr_lines[-20:])
-            print(f"[ERR] FFmpeg write BrokenPipe(码={self.process.poll()}), stderr:\n{stderr_text}")
-            return False
-        except Exception as e:
-            print(f"[ERR] FFmpeg write 异常: {e}")
-            return False
-
-    def isOpened(self):
-        return self.process is not None and self.process.poll() is None
-
-    def release(self):
-        if self.process:
-            try:
-                self.process.stdin.close()
-            except:
-                pass
-            try:
-                ret = self.process.wait(timeout=5)
-                if ret != 0:
-                    stderr_text = ''.join(self._stderr_lines[-20:])
-                    print(f"[WARN] FFmpeg 退出码: {ret}, stderr:\n{stderr_text}")
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-            self.process = None
-
-
 # ==================== 路径工具函数 ====================
 
 def get_image_save_path(step_name):
@@ -226,26 +114,6 @@ def get_image_save_path(step_name):
         print(f"生成图片路径失败: {e}")
         fallback_path = os.path.join(_config.IMAGE_BASE_DIR, f"{step_name}_{int(time.time())}.jpg")
         return fallback_path.replace("\\", "/")
-
-
-def get_video_save_path(user_id):
-    """生成考试视频的保存路径（跨平台）"""
-    try:
-        date_str = datetime.now().strftime("%Y%m%d")
-        time_str = datetime.now().strftime("%H%M%S")
-        dir_path = os.path.join(
-            _config.VIDEO_BASE_DIR,
-            _config.VIDEO_SUB_DIR.format(date=date_str, userid=user_id)
-        )
-        file_name = f"{user_id}_{time_str}.mp4"
-        full_path = os.path.join(dir_path, file_name)
-        os.makedirs(dir_path, exist_ok=True)
-        return full_path.replace("\\", "/")
-    except Exception as e:
-        print(f"生成视频路径失败: {e}")
-        fallback_path = os.path.join(_config.VIDEO_BASE_DIR, f"{user_id}_{int(time.time())}.mp4")
-        return fallback_path.replace("\\", "/")
-
 
 # ==================== 推理后端创建 ====================
 
@@ -695,17 +563,24 @@ def set_inference_pipeline(pipeline):
     _inference_pipeline = pipeline
 
 
-# DVPP 强制重连事件（由 /start 在帧获取失败时触发）
-_force_reconnect_event = threading.Event()
+def probe_health(decoder, use_aipp):
+    """AIPP 健康探测：拉一帧验证流可解，维护 _state.is_healthy。
 
-
-def force_reconnect_dvpp():
-    """请求 DVPP 解码器强制完整重连（soft_reset 不足以恢复长时间空闲后的死连接）
-
-    由 /start 在 get_current_frame 失败后调用，立即清零 reconnect_count
-    并触发 video_processor 线程重建解码器。
+    IDLE 时由 reader 线程周期性调用，/start 非阻塞读 _state.is_healthy 快照。
+    read_frame_aipp 内部自释放 VDEC buffer 并返回预分配复用 NV12 buffer，
+    调用方无需 dvpp_free，不会泄漏 NPU 内存。
     """
-    _force_reconnect_event.set()
+    if not (decoder and decoder.is_started and use_aipp):
+        return _state.is_healthy
+    try:
+        nv12_info, _ = decoder.read_frame_aipp()
+        if nv12_info is not None:
+            _state.is_healthy = True
+            return True
+    except Exception:
+        pass
+    _state.is_healthy = False
+    return False
 
 
 # ==================== 视频流处理 ====================
@@ -717,9 +592,6 @@ def _stream_processor_cv():
     TARGET_FPS = _config.VIDEO_WRITE_FPS
     FRAME_INTERVAL = 1.0 / TARGET_FPS
     last_frame_time = 0
-    write_frame_counter = 0
-    local_is_recording = False
-    local_writer = None
 
     while True:
         try:
@@ -738,8 +610,6 @@ def _stream_processor_cv():
                 FRAME_INTERVAL = 1.0 / TARGET_FPS
                 print(f"[OK] 视频流连接成功: {_state.frame_width}x{_state.frame_height} | 源帧率: {source_fps:.1f}fps | 处理帧率: {TARGET_FPS:.1f}fps")
                 last_frame_time = time.time()
-                write_frame_counter = 0
-                _state.frames_written = 0
 
             current_time = time.time()
             if current_time - last_frame_time < FRAME_INTERVAL:
@@ -752,23 +622,15 @@ def _stream_processor_cv():
                 if os.path.isfile(_config.RTSP_URL):
                     print("[VIDEO] 视频文件播放完毕，重新播放...")
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    write_frame_counter = 0
-                    _state.frames_written = 0
                     continue
                 else:
                     print(f"[WARN]  获取无效帧/断帧，重新连接视频源...")
                     cap.release()
                     cap = None
-                    local_is_recording = False
-                    local_writer = None
-                    write_frame_counter = 0
-                    _state.frames_written = 0
                     time.sleep(2)
                     continue
 
-            _dispatch_frame(frame, write_frame_counter, local_is_recording, local_writer)
-            local_is_recording, local_writer, write_frame_counter = \
-                _handle_recording(frame, local_is_recording, local_writer, write_frame_counter)
+            _dispatch_frame(frame)
 
         except Exception as e:
             print(f"视频流处理错误: {e}")
@@ -777,10 +639,6 @@ def _stream_processor_cv():
             if cap:
                 cap.release()
             cap = None
-            local_is_recording = False
-            local_writer = None
-            write_frame_counter = 0
-            _state.frames_written = 0
             time.sleep(5)
 
 
@@ -795,30 +653,15 @@ def _stream_processor_dvpp():
     TARGET_FPS = _config.VIDEO_WRITE_FPS
     FRAME_INTERVAL = 1.0 / TARGET_FPS
     last_frame_time = 0
-    write_frame_counter = 0
-    local_is_recording = False
-    local_writer = None
     reconnect_count = 0
     # Ascend 环境不允许回退 cv2，max_reconnect 提升至 10，递增等待 2/5/8/15/30/30/.../30s
     max_reconnect = getattr(_config, 'DVPP_MAX_RECONNECT', 10)
     use_aipp = getattr(_config, 'ASCEND_AIPP', False)
+    _last_probe_time = 0.0
+    _probe_fail_count = 0
 
     while True:
         try:
-            # 外部强制重连请求（/start 在帧获取失败时触发）
-            if _force_reconnect_event.is_set():
-                _force_reconnect_event.clear()
-                print("[DVPP] 收到强制重连请求，重建解码器...")
-                if decoder is not None:
-                    _cleanup_dvpp(decoder)
-                    decoder = None
-                    _state.dvpp_decoder = None
-                reconnect_count = 0  # 重置计数，避免触发 CPU 降级
-                local_is_recording = False
-                local_writer = None
-                write_frame_counter = 0
-                _state.frames_written = 0
-
             if decoder is None or not decoder.is_started:
                 if reconnect_count >= max_reconnect:
                     # Ascend 环境不回退 cv2，长睡后重置计数继续重试硬解码
@@ -867,8 +710,6 @@ def _stream_processor_dvpp():
                 print(f"[OK] DVPP 硬解码连接成功: {decoder.width}x{decoder.height} | "
                       f"解码器: {decoder_type}{aipp_str} | 处理帧率: {TARGET_FPS:.1f}fps")
                 last_frame_time = time.time()
-                write_frame_counter = 0
-                _state.frames_written = 0
 
             current_time = time.time()
             if current_time - last_frame_time < FRAME_INTERVAL:
@@ -876,14 +717,33 @@ def _stream_processor_dvpp():
                 continue
             last_frame_time = time.time()
 
-            # 待考状态（IDLE）：不读帧、不解码、不推理、不录屏，降低 CPU/NPU 占用
+            # 待考状态（IDLE）：AIPP 模式做健康探测维护 is_healthy，断流自愈；不读帧/不推理
             # demux 线程仍在后台拉流保活，RTSP 不会断；/start 时 exam_state=STARTING 立即唤醒
             if _state.exam_state == ExamState.IDLE:
+                if use_aipp and decoder is not None and decoder.is_started:
+                    _now = time.time()
+                    if _now - _last_probe_time >= 2.0:
+                        _last_probe_time = _now
+                        _was_healthy = _state.is_healthy
+                        probe_health(decoder, use_aipp)
+                        if not _state.is_healthy:
+                            _probe_fail_count += 1
+                            # 连续 3 次探测失败才重连（避免偶发抖动），之后每 3 次再试
+                            if _probe_fail_count >= 3 and _probe_fail_count % 3 == 0:
+                                print(f"[DVPP] IDLE 健康探测失败 {_probe_fail_count} 次，触发自愈重连")
+                                _cleanup_dvpp(decoder)
+                                decoder = None
+                                _state.dvpp_decoder = None
+                                reconnect_count = 0
+                        else:
+                            if not _was_healthy:
+                                print("[DVPP] IDLE 健康探测恢复")
+                            _probe_fail_count = 0
                 time.sleep(0.5)
                 continue
 
             if use_aipp:
-                # AIPP 零拷贝路径：同时获取 NV12 device buffer（推理）和 BGR 帧（显示/录制）
+                # AIPP 零拷贝路径：同时获取 NV12 device buffer（推理）和 BGR 帧（显示）
                 nv12_info, bgr_frame = decoder.read_frame_aipp()
                 if nv12_info is None:
                     # 先尝试软复位，快速恢复
@@ -899,10 +759,6 @@ def _stream_processor_dvpp():
                     decoder = None
                     _state.dvpp_decoder = None
                     reconnect_count += 1
-                    local_is_recording = False
-                    local_writer = None
-                    write_frame_counter = 0
-                    _state.frames_written = 0
                     if reconnect_count < max_reconnect:
                         time.sleep(2)
                     continue
@@ -918,7 +774,7 @@ def _stream_processor_dvpp():
                         except:
                             pass
 
-                # BGR 帧用于显示和录制
+                # BGR 帧用于显示
                 if bgr_frame is not None:
                     try:
                         while _state.frame_queue.full():
@@ -941,19 +797,13 @@ def _stream_processor_dvpp():
                     decoder = None
                     _state.dvpp_decoder = None
                     reconnect_count += 1
-                    local_is_recording = False
-                    local_writer = None
-                    write_frame_counter = 0
-                    _state.frames_written = 0
                     if reconnect_count < max_reconnect:
                         time.sleep(2)
                     continue
                 if not is_valid_frame(frame):
                     continue
 
-                _dispatch_frame(frame, write_frame_counter, local_is_recording, local_writer)
-                local_is_recording, local_writer, write_frame_counter = \
-                    _handle_recording(frame, local_is_recording, local_writer, write_frame_counter)
+                _dispatch_frame(frame)
 
         except Exception as e:
             print(f"DVPP 视频流处理错误: {e}")
@@ -963,10 +813,6 @@ def _stream_processor_dvpp():
             decoder = None
             _state.dvpp_decoder = None
             reconnect_count += 1
-            local_is_recording = False
-            local_writer = None
-            write_frame_counter = 0
-            _state.frames_written = 0
             if reconnect_count >= max_reconnect:
                 # Ascend 环境不回退 cv2，长睡后重置计数继续重试硬解码
                 print(f"[DVPP] 连续 {max_reconnect} 次异常，等待 60s 后继续重试硬解码（不降级 cv2）")
@@ -985,7 +831,7 @@ def _cleanup_dvpp(decoder):
         print(f"[Ascend-FFmpeg] 清理异常: {e}")
 
 
-def _dispatch_frame(frame, write_frame_counter, local_is_recording, local_writer):
+def _dispatch_frame(frame):
     """帧分发：放入推理/显示队列，提交推理"""
     try:
         while _state.frame_queue.full():
@@ -1004,49 +850,6 @@ def _dispatch_frame(frame, write_frame_counter, local_is_recording, local_writer
         _state.display_queue.put_nowait(frame.copy())
     except:
         pass
-
-
-def _handle_recording(frame, local_is_recording, local_writer, write_frame_counter, orig_size=None):
-    """录制逻辑处理，返回 (local_is_recording, local_writer, write_frame_counter)
-    DVPP 模式下录制由 demux 线程 PyAV remux 完成，此函数仅跟踪状态。
-    CPU 模式下此函数负责帧写入。
-    """
-    # DVPP 模式：demux 线程直接 remux，不需要帧写入
-    if _state.dvpp_decoder is not None and hasattr(_state.dvpp_decoder, 'is_recording'):
-        # 仅跟踪录制状态变化
-        if not local_is_recording and _state.exam_state == ExamState.RUNNING:
-            local_is_recording = True
-            print(f"[REC] DVPP PyAV remux 录制已激活")
-        if local_is_recording and _state.exam_state != ExamState.RUNNING:
-            print(f"[REC] DVPP 录制停止")
-            local_is_recording = False
-        return local_is_recording, local_writer, write_frame_counter
-
-    # CPU 模式：帧写入逻辑
-    if not local_is_recording or local_writer is None:
-        if _state.exam_state == ExamState.RUNNING and _state.video_writer is not None and _state.video_writer.isOpened():
-            local_is_recording = True
-            local_writer = _state.video_writer
-            write_frame_counter = 0
-            _state.frames_written = 0
-            print(f"[REC] 录制已激活，writer类型={type(local_writer).__name__}")
-        elif _state.exam_state == ExamState.RUNNING and write_frame_counter == 0:
-            print(f"[REC-DIAG] 录制未激活: video_writer is None or not opened")
-    if local_is_recording and local_writer is not None and local_writer.isOpened():
-        try:
-            local_writer.write(frame)
-            write_frame_counter += 1
-            _state.frames_written = write_frame_counter
-            if _config.DEBUG_MODE and write_frame_counter % 100 == 0:
-                print(f"[REC] 录制中：已写入{write_frame_counter}帧")
-        except Exception as e:
-            print(f"[WARN]  帧写入失败: {e}")
-    if _state.exam_state != ExamState.RUNNING and local_is_recording:
-        print(f"[REC] 录制停止，最后实际写入帧计数: {write_frame_counter}")
-        local_is_recording = False
-        local_writer = None
-        _state.frames_written = write_frame_counter
-    return local_is_recording, local_writer, write_frame_counter
 
 
 def stream_processor():
