@@ -707,7 +707,8 @@ class GlobalState:
         """软重置：清理用户相关状态，保留服务基础状态"""
         self.exam_state = ExamState.IDLE
         self.user_id = None
-        self.is_healthy = False
+        # 不重置 is_healthy：它由 reader IDLE 探测维护（见 video_processor.probe_health），
+        # /start 非阻塞读快照。此处清 False 会让 /start 在 hard_reset 后读到 False 永远 500。
 
         self.video_path = None
         self.frames_written = 0

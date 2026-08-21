@@ -347,6 +347,30 @@ except ImportError:
     _HAS_PYAV = False
 
 # VDEC 编码类型常量
+def _open_av_bounded(rtsp_url, timeout=8.0):
+    """有界 _av.open：用 worker 线程 + join(timeout) 逃离可能阻塞的 C 调用。
+
+    PyAV 的 _av.open 对半开 TCP 连接可能无限阻塞（stimeout 不可靠），
+    直接调用会卡死调用线程。此处用独立线程承载，超时后放弃该线程，
+    调用方按连接失败处理（被放弃的 worker 为 daemon，进程退出时自动回收）。
+    """
+    holder = {"container": None, "error": None}
+
+    def _worker():
+        try:
+            holder["container"] = _av.open(rtsp_url, options={
+                'rtsp_transport': 'tcp', 'stimeout': '5000000'})
+        except BaseException as e:
+            holder["error"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        return None, TimeoutError(f"_av.open timeout {timeout}s: {rtsp_url}")
+    return holder["container"], holder["error"]
+
+
 ENTYPE_H265_MAIN = 0
 ENTYPE_H264_BASE = 1
 ENTYPE_H264_MAIN = 2
@@ -433,6 +457,11 @@ class AclVdecDecoder(BaseVideoDecoder):
         self._is_h265 = False
         self._demux_thread = None
         self._demux_running = False
+        self._demux_gen = 0  # demux thread gen: abandoned old thread must not clear new thread flag in finally
+        self._last_frame_ts = 0.0  # VDEC frame-starvation watchdog baseline (updated on decoded frame)
+        self._starvation_sec = 12.0  # starvation threshold (sec) without decoded frame -> soft recovery
+        self._last_nal_ts = 0.0  # demux stall detection baseline (updated on NAL output)
+        self._demux_container = None  # current container of demux thread, force-closed on join timeout
         self._nal_queue = queue.Queue(maxsize=128)  # NAL 包队列
 
         # 帧队列（回调 → 主线程）
@@ -463,6 +492,7 @@ class AclVdecDecoder(BaseVideoDecoder):
 
                 if ret_code <= 1 and pic_data is not None and pic_size > 0 and user_data is not None and user_data >= 0:
                     # 有效图像帧 — 入队列，主线程用完 dvpp_free
+                    self._last_frame_ts = time.time()  # frame-starvation watchdog: decoded one frame
                     try:
                         self._frame_queue.put_nowait({"buffer": pic_data, "size": pic_size})
                     except queue.Full:
@@ -719,9 +749,9 @@ class AclVdecDecoder(BaseVideoDecoder):
         跨线程调用 demux 会阻塞。所以 demux 线程自己拥有 container，
         通过 NAL 队列传递数据给 read_frame 线程。
         """
-        self._demux_running = True
-        self._demux_thread = threading.Thread(target=self._demux_loop, daemon=True)
-        self._demux_thread.start()
+        self._last_nal_ts = time.time()  # reset stall-detection timer
+        self._last_frame_ts = time.time()  # frame-starvation watchdog baseline
+        self._start_demux_thread()
 
         # 等待 demux 线程产出首批 NAL 包（最多 5 秒）
         for _ in range(50):
@@ -738,63 +768,116 @@ class AclVdecDecoder(BaseVideoDecoder):
         print(f"[AclVdec] demux 线程已启动，NAL 队列有数据")
         return True
 
+    def _check_starvation(self):
+        """Frame-starvation watchdog: demux thread alive but no decoded frame beyond threshold -> soft recovery.
+
+        When demux thread blocks inside container.demux(), _demux_running stays True,
+        so the `if not self._demux_running` branch in read paths never triggers reconnect.
+        Actively set _demux_running=False so next read goes through _reconnect_demux self-healing.
+        """
+        if self._demux_running and self._last_frame_ts and \
+                (time.time() - self._last_frame_ts) > self._starvation_sec:
+            print(f"[AclVdec] frame starvation {time.time() - self._last_frame_ts:.0f}s, force soft recovery")
+            self._demux_running = False
+
+    def is_demux_stalled(self, threshold: float = 30.0) -> bool:
+        """Whether demux thread is stalled (alive but no NAL output for long).
+
+        Threshold 30s is larger than normal RTSP reconnect gap (5s sleep + connect), avoids false positives.
+        """
+        if not self._demux_running or self._demux_thread is None or not self._demux_thread.is_alive():
+            return False
+        if self._last_nal_ts == 0.0:
+            return False
+        return (time.time() - self._last_nal_ts) > threshold
+
+    def _start_demux_thread(self):
+        """Start a new demux thread (bump gen; abandoned old thread's finally skips clearing flag)."""
+        self._demux_gen += 1
+        self._demux_running = True
+        self._demux_thread = threading.Thread(target=self._demux_loop, daemon=True)
+        self._demux_thread.start()
+
     def _demux_loop(self):
-        """demux 线程主循环：PyAV demux -> NAL 队列 -> VDEC 解码
+        """demux thread main loop: PyAV demux -> NAL queue -> VDEC decode.
 
-        此线程独占 PyAV container，不与其他线程共享。
-        Packet 的 bytes 送 NAL 队列供 VDEC 解码。
-
-        连接断开后自动重试，直到 _demux_running 被设为 False。
+        This thread exclusively owns the PyAV container, never shared with other threads.
+        Auto-retries after disconnect until _demux_running is set False.
         """
         self._demux_retry_count = 0
-        while self._demux_running:
+        my_gen = self._demux_gen  # my gen: after being abandoned, finally must not clear new thread flag
+        while self._demux_running and my_gen == self._demux_gen:
+            # gen guard: an abandoned old thread (join timeout in _stop_demux) must not
+            # revive and open a new RTSP connection, feeding the same _nal_queue twice
             container = None
+            self._demux_container = None
             try:
-                container = _av.open(self.rtsp_url, options={
-                    'rtsp_transport': 'tcp', 'stimeout': '5000000'})
-                video_stream = container.streams.video[0]
-                self._video_stream = video_stream
-                self._demux_retry_count = 0  # 连接成功，重置退避计数
+                container, err = _open_av_bounded(self.rtsp_url)
+                if container is None:
+                    # _av.open timeout or failure (half-open TCP), treat as connect failure and retry
+                    self._demux_retry_count += 1
+                    if self._demux_retry_count == 1 or self._demux_retry_count % 10 == 0:
+                        print(f"[AclVdec] demux thread: RTSP connect failed({err}), retry #{self._demux_retry_count}, after {min(5 * self._demux_retry_count, 60)}s")
+                else:
+                    self._demux_container = container  # for _stop_demux join-timeout force close
+                    video_stream = container.streams.video[0]
+                    self._video_stream = video_stream
+                    self._demux_retry_count = 0  # connected, reset backoff
 
-                for packet in container.demux([video_stream]):
-                    if not self._demux_running:
-                        break
-                    # NAL 包送队列 -> VDEC 解码
-                    nal = bytes(packet)
-                    if len(nal) == 0:
-                        continue
-                    try:
-                        self._nal_queue.put(nal, timeout=0.5)
-                    except queue.Full:
-                        pass
+                    for packet in container.demux([video_stream]):
+                        if not self._demux_running:
+                            break
+                        # NAL packet -> queue -> VDEC decode
+                        nal = bytes(packet)
+                        if len(nal) == 0:
+                            continue
+                        try:
+                            self._nal_queue.put(nal, timeout=0.5)
+                            self._last_nal_ts = time.time()
+                        except queue.Full:
+                            pass
 
             except _av.error.EOFError:
                 self._demux_retry_count += 1
                 if self._demux_retry_count == 1 or self._demux_retry_count % 10 == 0:
-                    print(f"[AclVdec] demux 线程: RTSP 流 EOF，第 {self._demux_retry_count} 次重试，{min(5 * self._demux_retry_count, 60)}s 后重试")
+                    print(f"[AclVdec] demux thread: RTSP EOF, retry #{self._demux_retry_count}, after {min(5 * self._demux_retry_count, 60)}s")
             except Exception as e:
                 self._demux_retry_count += 1
                 if self._demux_retry_count == 1 or self._demux_retry_count % 10 == 0:
-                    print(f"[AclVdec] demux 线程异常: {e}，第 {self._demux_retry_count} 次重试，{min(5 * self._demux_retry_count, 60)}s 后重试")
+                    print(f"[AclVdec] demux thread error: {e}, retry #{self._demux_retry_count}, after {min(5 * self._demux_retry_count, 60)}s")
             finally:
                 if container is not None:
                     try:
                         container.close()
                     except Exception:
                         pass
-            # 连接断开，指数退避后重试（5/10/15/.../60s 封顶）
+                self._demux_container = None
+            # disconnected: exponential backoff then retry (5/10/15/.../60s capped)
             if self._demux_running:
                 time.sleep(min(5 * self._demux_retry_count, 60))
-        # 退出循环时清理
-        self._demux_running = False
+        # cleanup on loop exit (only if gen unchanged, so abandoned old thread won't clear new flag)
+        if my_gen == self._demux_gen:
+            self._demux_running = False
 
     def _stop_demux(self):
-        """停止 demux 线程"""
+        """Stop the demux thread.
+
+        On join timeout (> stimeout 5s still alive) abandon the thread. NEVER close the
+        container from another thread: the demux thread may still be blocked inside
+        container.demux(); ffmpeg is not thread-safe, cross-thread close is
+        use-after-free (caused C-level segfault with no traceback).
+        The abandoned thread's generation is stale: the gen guard in _demux_loop stops
+        it from reconnecting, and its finally won't clear the new thread's flags.
+        """
         self._demux_running = False
         if self._demux_thread is not None:
-            self._demux_thread.join(timeout=3)
+            # 8s > stimeout 5s: give socket-blocked threads time to self-unblock first
+            self._demux_thread.join(timeout=8)
+            if self._demux_thread.is_alive():
+                print(f"[AclVdec] demux thread join timeout, abandon old thread (stale gen, not closing container)")
+                self._demux_container = None
             self._demux_thread = None
-        # 清空 NAL 队列
+        # clear NAL queue
         while not self._nal_queue.empty():
             try:
                 self._nal_queue.get_nowait()
@@ -802,36 +885,33 @@ class AclVdecDecoder(BaseVideoDecoder):
                 break
 
     def _reconnect_demux(self):
-        """demux 线程断开后自动重连 RTSP"""
-        # 如果 demux 线程还活着（可能正在重连中），不重复启动
+        """Auto-reconnect RTSP after demux thread dies (force-restart when stalled, keep VDEC channel)"""
+        # if demux thread still alive, check whether stalled (long time no NAL output)
         if self._demux_running and self._demux_thread is not None and self._demux_thread.is_alive():
-            # demux 线程还活着，检查 NAL 队列是否有数据
             if not self._nal_queue.empty():
-                return True
-            return False  # 还在连接中，下次 read_frame 再检查
+                return True  # normal output
+            if self.is_demux_stalled():
+                # demux blocked in container.demux(), force-restart thread (do NOT destroy VDEC channel)
+                print(f"[AclVdec] demux thread stalled, force restart (keep VDEC channel)")
+                self._stop_demux()
+                # fall through to restart below
+            else:
+                return False  # still connecting, check next time
 
         now = time.time()
-        # 限频：10 秒内不重复创建 demux 线程
+        # rate limit: no duplicate demux thread creation within 10s
         if now - getattr(self, '_last_reconnect_ts', 0) < 10:
             return False
         self._last_reconnect_ts = now
 
-        print(f"[AclVdec] demux 线程已断开，尝试重连 RTSP...")
+        print(f"[AclVdec] demux thread gone, trying RTSP reconnect...")
         self._stop_demux()
 
-        # 发送 EOS 刷出 VDEC 残余帧，重置解码状态
-        try:
-            if self._vdec_ch_desc is not None and self._frame_cfg is not None:
-                acl.media.vdec_set_frame_config_eos(self._frame_cfg, 1)
-                sd = acl.media.dvpp_create_stream_desc()
-                acl.media.dvpp_set_stream_desc_data(sd, 0)
-                acl.media.dvpp_set_stream_desc_size(sd, 0)
-                acl.media.vdec_send_frame(self._vdec_ch_desc, sd, 0, self._frame_cfg, -1)
-                time.sleep(0.3)
-        except Exception:
-            pass
-
-        # 清空帧队列，释放残余 device buffer
+        # NO EOS sent: old impl set vdec_set_frame_config_eos(cfg,1) and never reset to 0,
+        # later _send_nal_to_vdec's vdec_send_frame inherited eos=1 so VDEC dropped real
+        # frames as EOS (sent=1 cb=0 dead window). Without it VDEC keeps sequence-header
+        # context; after demux reconnect the new IDR re-syncs, stale fragments covered by IDR.
+        # clear frame queue, free leftover device buffers
         while not self._frame_queue.empty():
             try:
                 info = self._frame_queue.get_nowait()
@@ -841,7 +921,7 @@ class AclVdecDecoder(BaseVideoDecoder):
                 break
         self._vdec_cb_count = 0
         self._flush_desc_queue()
-        # 清空延迟 desc 队列中的 stream_desc/pic_desc
+        # clear deferred desc queue (stream_desc/pic_desc)
         while not self._desc_queue.empty():
             try:
                 sd, pd = self._desc_queue.get_nowait()
@@ -851,33 +931,50 @@ class AclVdecDecoder(BaseVideoDecoder):
                     acl.media.dvpp_destroy_pic_desc(pd)
             except queue.Empty:
                 break
-        # 清空 NAL 队列
+        # clear NAL queue
         while not self._nal_queue.empty():
             try:
                 self._nal_queue.get_nowait()
             except queue.Empty:
                 break
-        # 重新启动 demux 线程
-        self._demux_running = True
-        self._demux_thread = threading.Thread(target=self._demux_loop, daemon=True)
-        self._demux_thread.start()
-        # 等待首批 NAL 包（最多 5 秒）
+        # restart demux thread
+        self._last_nal_ts = time.time()  # reset stall-detection timer
+        self._last_frame_ts = time.time()  # reset frame-starvation watchdog baseline
+        self._start_demux_thread()
+        # wait for first NAL packets (max 5s)
         for _ in range(50):
             if not self._nal_queue.empty():
-                print(f"[AclVdec] RTSP 重连成功，执行软复位刷新VDEC缓存")
-                self.soft_reset()
+                print(f"[AclVdec] RTSP reconnect ok, clear frame cache")
+                # clear frame queue + desc queue (no soft_reset to avoid recursively stopping demux)
+                while not self._frame_queue.empty():
+                    try:
+                        info = self._frame_queue.get_nowait()
+                        if isinstance(info, dict) and info.get("buffer"):
+                            acl.media.dvpp_free(info["buffer"])
+                    except queue.Empty:
+                        break
+                self._flush_desc_queue()
+                while not self._desc_queue.empty():
+                    try:
+                        sd, pd = self._desc_queue.get_nowait()
+                        if sd is not None:
+                            acl.media.dvpp_destroy_stream_desc(sd)
+                        if pd is not None:
+                            acl.media.dvpp_destroy_pic_desc(pd)
+                    except queue.Empty:
+                        break
+                self._vdec_cb_count = 0
+                self._frame_count = 0
                 return True
             if not self._demux_running:
                 break
             time.sleep(0.1)
-        # 超时但 demux 线程可能仍在重试，下次 read_frame 会继续检查
+        # timeout but demux thread may still be retrying, next read_frame keeps checking
         if self._demux_running:
-            print(f"[AclVdec] RTSP 尚未连上，demux 线程后台继续重试")
+            print(f"[AclVdec] RTSP not yet up, demux thread keeps retrying in background")
         else:
-            print(f"[AclVdec] RTSP 重连失败")
+            print(f"[AclVdec] RTSP reconnect failed")
         return False
-
-    # ==================== 帧读取 ====================
 
     def _send_nal_to_vdec(self, nal_data, user_data):
         """发送 NAL 包到 VDEC 解码
@@ -1065,6 +1162,7 @@ class AclVdecDecoder(BaseVideoDecoder):
             return None
 
         # demux 线程已死 → 自动重连
+        self._check_starvation()
         if not self._demux_running:
             if not self._reconnect_demux():
                 return None
@@ -1112,6 +1210,7 @@ class AclVdecDecoder(BaseVideoDecoder):
             return None
 
         # demux 线程已死 → 自动重连
+        self._check_starvation()
         if not self._demux_running:
             if not self._reconnect_demux():
                 return None
@@ -1156,6 +1255,7 @@ class AclVdecDecoder(BaseVideoDecoder):
         if not self._started:
             return None
 
+        self._check_starvation()
         if not self._demux_running:
             if not self._reconnect_demux():
                 return None
@@ -1200,6 +1300,7 @@ class AclVdecDecoder(BaseVideoDecoder):
         if not self._started:
             return None, None
 
+        self._check_starvation()
         if not self._demux_running:
             if not self._reconnect_demux():
                 return None, None
@@ -1270,7 +1371,7 @@ class AclVdecDecoder(BaseVideoDecoder):
                 return nv12_dict, bgr
 
             else:
-                if attempt == 0 and self._frame_count <= 5:
+                if attempt == 0:
                     print(f"[AclVdec] AIPP 超时: cb={self._vdec_cb_count} nal_q={self._nal_queue.qsize()}")
 
         return None, None

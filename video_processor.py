@@ -730,11 +730,14 @@ def _stream_processor_dvpp():
                             _probe_fail_count += 1
                             # 连续 3 次探测失败才重连（避免偶发抖动），之后每 3 次再试
                             if _probe_fail_count >= 3 and _probe_fail_count % 3 == 0:
-                                print(f"[DVPP] IDLE 健康探测失败 {_probe_fail_count} 次，触发自愈重连")
-                                _cleanup_dvpp(decoder)
-                                decoder = None
-                                _state.dvpp_decoder = None
-                                reconnect_count = 0
+                                print(f"[DVPP] IDLE 健康探测失败 {_probe_fail_count} 次，触发软恢复（保留 VDEC 通道）")
+                                try:
+                                    if hasattr(decoder, '_reconnect_demux'):
+                                        decoder._reconnect_demux()
+                                    else:
+                                        decoder.soft_reset()
+                                except Exception as e:
+                                    print(f"[DVPP] 软恢复异常: {e}")
                         else:
                             if not _was_healthy:
                                 print("[DVPP] IDLE 健康探测恢复")
@@ -746,21 +749,16 @@ def _stream_processor_dvpp():
                 # AIPP 零拷贝路径：同时获取 NV12 device buffer（推理）和 BGR 帧（显示）
                 nv12_info, bgr_frame = decoder.read_frame_aipp()
                 if nv12_info is None:
-                    # 先尝试软复位，快速恢复
-                    if hasattr(decoder, 'soft_reset'):
-                        try:
+                    # 纯软恢复：_reconnect_demux 重启 demux（保留 VDEC 通道，绝不 release）
+                    print("[WARN] DVPP AIPP 读取帧失败，软恢复（保留 VDEC 通道）...")
+                    try:
+                        if hasattr(decoder, '_reconnect_demux'):
+                            decoder._reconnect_demux()
+                        else:
                             decoder.soft_reset()
-                            nv12_info, bgr_frame = decoder.read_frame_aipp()
-                        except Exception:
-                            nv12_info = None
-                if nv12_info is None:
-                    print("[WARN] DVPP AIPP 读取帧失败，重新连接...")
-                    _cleanup_dvpp(decoder)
-                    decoder = None
-                    _state.dvpp_decoder = None
-                    reconnect_count += 1
-                    if reconnect_count < max_reconnect:
-                        time.sleep(2)
+                    except Exception as e:
+                        print(f"[DVPP] 软恢复异常: {e}")
+                    time.sleep(2)
                     continue
 
                 # AIPP 模式：提交 device buffer 给推理管线（零拷贝）
@@ -792,13 +790,14 @@ def _stream_processor_dvpp():
                 # 非 AIPP 路径：读取 BGR 帧
                 frame = decoder.read_frame()
                 if frame is None:
-                    print("[WARN] DVPP 读取帧失败，重新连接...")
-                    _cleanup_dvpp(decoder)
-                    decoder = None
-                    _state.dvpp_decoder = None
-                    reconnect_count += 1
-                    if reconnect_count < max_reconnect:
-                        time.sleep(2)
+                    # 纯软恢复：_reconnect_demux 重启 demux（保留 VDEC 通道，绝不 release）
+                    print("[WARN] DVPP 读取帧失败，软恢复（保留 VDEC 通道）...")
+                    try:
+                        if hasattr(decoder, '_reconnect_demux'):
+                            decoder._reconnect_demux()
+                    except Exception as e:
+                        print(f"[DVPP] 软恢复异常: {e}")
+                    time.sleep(2)
                     continue
                 if not is_valid_frame(frame):
                     continue
