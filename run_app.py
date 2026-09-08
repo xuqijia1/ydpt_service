@@ -313,9 +313,9 @@ class StepValidator:
                 'min_stable_frames': 1,
                 'always_pass': True,  # 无条件通过标志
             },
-            5: {  # 选择检查脚轮（只需要4个脚轮，不需要手套）
+            5: {  # 选择检查脚轮（放宽到3个即可，不需要手套）
                 'required_classes': ['滑动脚轮'],
-                'min_count': {'滑动脚轮': 4},
+                'min_count': {'滑动脚轮': 3},
                 'min_stable_frames': 5,
             },
             6: {  # 门架安装脚轮
@@ -335,10 +335,9 @@ class StepValidator:
                 'required_classes': ['爬梯'],
                 'min_stable_frames': 5,
             },
-            10: {  # 安全带使用
+            10: {  # 安全带使用（识别到安全带挂钩即可，去掉挂钩区区域检查）
                 'required_classes': ['安全带挂钩'],
-                'zone_check': '安全带挂钩区',
-                'min_stable_frames': 5,
+                'min_stable_frames': 3,
             },
             11: {  # 搭设防护栏
                 'required_classes': ['防护栏'],
