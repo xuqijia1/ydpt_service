@@ -115,6 +115,21 @@ def get_image_save_path(step_name):
         fallback_path = os.path.join(_config.IMAGE_BASE_DIR, f"{step_name}_{int(time.time())}.jpg")
         return fallback_path.replace("\\", "/")
 
+
+def select_step_frame(vis_frame, bgr_frame=None, use_aipp=False):
+    """Choose a real BGR frame for step evidence in AIPP mode."""
+    if use_aipp:
+        return bgr_frame
+    return vis_frame
+
+
+def unpack_inference_result(result):
+    """Normalize inference results from thread and process workers."""
+    if len(result) == 2:
+        detections, vis_frame = result
+        return detections, vis_frame, None
+    return result
+
 # ==================== 推理后端创建 ====================
 
 def create_inference_backend():
@@ -472,7 +487,7 @@ class InferencePipeline:
         self._result_thread.start()
         return "Ascend多线程" if self._is_thread_mode else f"YOLOv8多进程(PID={self._worker.pid})"
 
-    def submit_frame(self, frame):
+    def submit_frame(self, frame, step_frame=None):
         try:
             while self.frame_queue.full():
                 try: self.frame_queue.get_nowait()
@@ -480,7 +495,10 @@ class InferencePipeline:
             if self._is_thread_mode:
                 # AIPP 模式下 frame 是 device buffer dict，不需要 copy
                 if isinstance(frame, dict):
-                    self.frame_queue.put_nowait(frame)
+                    # The inference engine returns a black visualization for NV12 input.
+                    # Keep the matching host BGR frame for step evidence and screenshots.
+                    evidence_frame = step_frame.copy() if step_frame is not None else None
+                    self.frame_queue.put_nowait((frame, evidence_frame))
                 else:
                     self.frame_queue.put_nowait(frame.copy())
             else:
@@ -509,10 +527,14 @@ class InferencePipeline:
                     _tracker.next_id = 0
                 self._reset_flag = False
             try:
-                frame = self.frame_queue.get(timeout=0.1)
+                task = self.frame_queue.get(timeout=0.1)
             except:
                 continue
             try:
+                if isinstance(task, tuple):
+                    frame, evidence_frame = task
+                else:
+                    frame, evidence_frame = task, None
                 # frame 可能是 numpy array 或 AIPP device buffer dict，直接传给推理引擎
                 detections, vis_frame, det_texts = analyze_frame_with_tracking(frame)
                 _state.latest_det_texts = det_texts
@@ -520,7 +542,7 @@ class InferencePipeline:
                     while self.result_queue.full():
                         try: self.result_queue.get_nowait()
                         except: break
-                    self.result_queue.put_nowait((detections, vis_frame))
+                    self.result_queue.put_nowait((detections, vis_frame, evidence_frame))
                 except:
                     pass
             except:
@@ -530,7 +552,8 @@ class InferencePipeline:
         use_aipp = getattr(_config, 'ASCEND_AIPP', False)
         while True:
             try:
-                detections, vis_frame = self.result_queue.get(timeout=0.1)
+                result = self.result_queue.get(timeout=0.1)
+                detections, vis_frame, evidence_frame = unpack_inference_result(result)
                 for det in detections:
                     track_id = det.get('track_id')
                     if track_id is not None:
@@ -547,7 +570,8 @@ class InferencePipeline:
                 if _state.user_id and _config.ENABLE_CLIENT_CALLBACK:
                     csharp_data = build_csharp_coordinate_data(detections, recog_area=_config.RECOG_AREA)
                     _callback_sender.send_coordinates(csharp_data, _state.user_id)
-                check_step_logic_enhanced(detections, vis_frame)
+                step_frame = select_step_frame(vis_frame, evidence_frame, use_aipp)
+                check_step_logic_enhanced(detections, step_frame)
             except:
                 continue
 
@@ -764,13 +788,7 @@ def _stream_processor_dvpp():
                 # AIPP 模式：提交 device buffer 给推理管线（零拷贝）
                 if _state.inference_backend and _state.exam_state == ExamState.RUNNING and _state.user_id:
                     if _inference_pipeline is not None:
-                        try:
-                            while _inference_pipeline.frame_queue.full():
-                                try: _inference_pipeline.frame_queue.get_nowait()
-                                except: break
-                            _inference_pipeline.frame_queue.put_nowait(nv12_info)
-                        except:
-                            pass
+                        _inference_pipeline.submit_frame(nv12_info, step_frame=bgr_frame)
 
                 # BGR 帧用于显示
                 if bgr_frame is not None:
