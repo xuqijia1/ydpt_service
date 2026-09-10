@@ -306,7 +306,7 @@ class StepValidator:
             3: {  # 设定作业区域
                 'required_classes': ['围栏', '标识牌'],
                 'min_count': {'围栏': 1, '标识牌': 1},
-                'min_stable_frames': 3,
+                'min_stable_frames': 2,
             },
             4: {  # 检查工器具（无条件通过）
                 'required_classes': [],
@@ -315,13 +315,13 @@ class StepValidator:
             },
             5: {  # 选择检查脚轮（放宽到3个即可，不需要手套）
                 'required_classes': ['滑动脚轮'],
-                'min_count': {'滑动脚轮': 3},
+                'min_count': {'滑动脚轮': 2},
                 'min_stable_frames': 5,
             },
             6: {  # 门架安装脚轮
                 'required_classes': ['门架', '滑动脚轮'],
-                'min_count': {'门架': 2, '滑动脚轮': 2},
-                'min_stable_frames': 5,
+                'min_count': {'门架': 1, '滑动脚轮': 2},
+                'min_stable_frames': 3,
             },
             7: {  # 安装交叉支撑
                 'required_classes': ['交叉杆'],
@@ -333,11 +333,11 @@ class StepValidator:
             },
             9: {  # 搭设、使用爬梯
                 'required_classes': ['爬梯'],
-                'min_stable_frames': 5,
+                'min_stable_frames': 3,
             },
             10: {  # 安全带使用（识别到安全带挂钩即可，去掉挂钩区区域检查）
-                'required_classes': ['安全带挂钩'],
-                'min_stable_frames': 3,
+                'required_classes': ['安全带'],
+                'min_stable_frames': 5,
             },
             11: {  # 搭设防护栏
                 'required_classes': ['防护栏'],
